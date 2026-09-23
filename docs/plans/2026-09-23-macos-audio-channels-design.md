@@ -28,3 +28,7 @@ An AudioServer plug-in with a userspace bridge is the second option if macOS 27 
 ## Rollback
 
 Leave `macos_handle_aggregates` disabled and the existing Loopback devices in place until the replacement is proven. Any temporary aggregate test device must be destroyed after the test.
+
+## macOS 27 result
+
+The USB-to-CoreAudio matcher found the connected GoXLR Full. Temporary Chat and Music aggregates played 48 kHz stereo test tones; the user confirmed that their corresponding GoXLR faders changed the tones. CoreAudio still reports 10 outputs and 23 inputs for these aggregates. FFmpeg received zero samples from the Chat Mic aggregate, the existing Loopback Microphone, and the built-in MacBook microphone, so command-line capture could not assess the microphone. In Discord the Chat Mic aggregate produced a moving input meter, but its microphone test sounded severely broken. The existing Loopback Microphone sounded substantially better in the same test. All temporary devices were removed and system defaults stayed unchanged. The approved next step is a single Audio Server Plug-in exposing three true stereo devices, documented in `2026-09-23-macos-virtual-driver-design.md`.

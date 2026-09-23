@@ -115,24 +115,30 @@ pub async fn run(tx: mpsc::Sender<EventTriggers>, mut stop: Shutdown) -> Result<
 
 fn create_devices(device: CoreAudioDevice) -> Result<Vec<AudioDeviceID>> {
     let mut devices = vec![];
+    let result = (|| -> Result<()> {
+        for output in Outputs::iter() {
+            let aggregate = create_aggregate_device(output.get_name(), &device)?;
+            devices.push(aggregate);
+            add_sub_device(aggregate, device.uid.clone())?;
+            set_active_channels(aggregate, false, output.get_channels())?;
+        }
 
-    // Create the Aggregates for the Outputs..
-    for output in Outputs::iter() {
-        let aggregate = create_aggregate_device(output.get_name(), &device)?;
+        for input in Inputs::iter() {
+            let aggregate = create_aggregate_device(input.get_name(), &device)?;
+            devices.push(aggregate);
+            add_sub_device(aggregate, device.uid.clone())?;
+            set_active_channels(aggregate, true, input.get_channels())?;
+        }
+        Ok(())
+    })();
 
-        add_sub_device(aggregate, device.uid.clone())?;
-        set_active_channels(aggregate, false, output.get_channels())?;
-
-        devices.push(aggregate);
-    }
-
-    // Create the Aggregates for the Inputs..
-    for input in Inputs::iter() {
-        let aggregate = create_aggregate_device(input.get_name(), &device)?;
-        add_sub_device(aggregate, device.uid.clone())?;
-        set_active_channels(aggregate, true, input.get_channels())?;
-
-        devices.push(aggregate);
+    if let Err(error) = result {
+        for aggregate in devices {
+            if let Err(cleanup_error) = destroy_aggregate_device(aggregate) {
+                warn!("Unable to Remove Partial Aggregate {aggregate}: {cleanup_error}");
+            }
+        }
+        return Err(error);
     }
 
     Ok(devices)
