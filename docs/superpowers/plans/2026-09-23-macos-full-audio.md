@@ -2,11 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Expose all GoXLR Full capture and playback channels as selectable macOS audio devices and retire Loopback from active routing after verification.
+**Goal:** Expose all GoXLR Full capture and playback channels as selectable macOS audio devices, show only the user's five preferred routes by default, and retire Loopback from active routing after verification.
 
-**Architecture:** Extend the existing AudioServer plug-in with 12 capture and 5 playback devices, each paired with a hidden bridge device. Keep one physical 23-channel input and one physical 10-channel output AudioUnit in the Rust daemon; dispatch and combine frames by the fixed hardware channel map.
+**Architecture:** Extend the existing AudioServer plug-in with 12 capture and 5 playback devices, each paired with a hidden bridge device. A live CoreAudio plug-in property controls which user-facing devices are visible. The Utility persists the selection and the daemon starts audio units only for enabled routes, while keeping one physical 23-channel input and one physical 10-channel output AudioUnit.
 
-**Tech Stack:** C++17, libASPL, CoreAudio HAL, Rust, coreaudio-rs, CMake, Cargo.
+**Tech Stack:** C++17, libASPL, CoreAudio HAL, Rust, coreaudio-rs, Vue 3, Vite, CMake, Cargo.
 
 ---
 
@@ -35,11 +35,27 @@
 - [ ] In the one physical output callback, fill five route buffers and copy them to their 10-channel output offsets. Reuse fixed buffers across callbacks and avoid allocation, logging, or locks on the audio thread.
 - [ ] Extend mapping tests to assert all 23 input indices, all 10 output indices, mono Dry Mic, and unchanged Microphone/Chat/Music assignments. Run the targeted Rust tests and an arm64 release build.
 
-### Task 4: Local system validation and Loopback migration
+### Task 4: Live device visibility and persisted selection
+
+**Files:** `macos/virtual-audio/Driver.cpp`, `daemon/src/platform/macos/audio_bridge.rs`, `daemon/src/settings.rs`, `daemon/src/primary_worker.rs`, `ipc/src/lib.rs`, `ipc/src/device.rs`, and the daemon startup path.
+
+- [ ] Register a writable plug-in custom property with selector `0x67787274` (`gxrt`). Its CFString value is a 17-bit hexadecimal route mask in the design table's order. The driver defaults to Microphone plus System, Game, Chat, Music, and applies `SetIsHidden` to each visible device when a validated mask arrives. Bridge peers stay hidden.
+- [ ] Discover the plug-in ID by bundle identifier and send the mask through `AudioObjectSetPropertyData`. Prove on this Mac that a switch changes `system_profiler SPAudioDataType` without restarting `coreaudiod`; otherwise revise this design before adding the UI.
+- [ ] Persist `macos_virtual_audio_routes` as a 17-bit mask, defaulted to `0xF002` (Microphone bit 1; System/Game/Chat/Music bits 12–15), validate unknown bits, and expose it in `DaemonConfig` and a new `SetMacOSVirtualAudioRoutes(u32)` IPC command.
+- [ ] Make the bridge start only enabled route audio units and rebuild when the mask or CoreAudio device IDs change. Keep polling when the driver is absent. Add focused tests for default mask, route order, disabled-route exclusion, and unchanged old UIDs.
+
+### Task 5: Utility switches
+
+**Files:** `../goxlr-ui/src/components/sections/system/modals/SettingsButton.vue`, `../goxlr-ui/src/lang/languages/en_GB.js`, and the generated `daemon/web-content` bundle.
+
+- [ ] Add a macOS-only virtual audio section with input and output switches in the approved route order. Read `macos_virtual_audio_routes` from `DaemonConfig`; each switch sends `SetMacOSVirtualAudioRoutes` with exactly one bit changed. Name the first five defaults clearly and label optional capture feeds separately.
+- [ ] Build with the UI repository's npm/Vite workflow and copy only its built assets into `daemon/web-content`. Check keyboard access and screen-reader labels for the switches.
+
+### Task 6: Local system validation and Loopback migration
 
 **Files:** `macos/virtual-audio/README.md`; locally built bundle and test app only.
 
 - [ ] Record the existing defaults and preserve the currently installed driver bundle for rollback. Stop the test daemon, replace only the GoXLRVirtual driver using the existing scoped uninstall/install scripts, then launch a newly signed local test app with microphone permission.
-- [ ] Confirm 17 visible devices, the 12 input/5 output directions, 48 kHz, Mono Dry Mic, and stable old UIDs. Test low-level tones separately on System, Game, Chat, Music, and Sample; check each GoXLR path/fader. Check Microphone in Discord and speech-to-text, plus the other capture sources using available known signals.
+- [ ] Confirm five visible default devices, the correct direction and 48 kHz rate, and stable old UIDs. Enable Dry Mic through the UI and confirm it appears as mono, then disable it and confirm it disappears without `coreaudiod` restart. Test low-level tones on System, Game, Chat, and Music; check each GoXLR path/fader. Check Microphone in Discord and speech-to-text.
 - [ ] Restart the daemon and confirm recovery. Compare short CPU/RSS samples against the three-device baseline.
 - [ ] Only after System audio succeeds, switch macOS default output and system sound from Loopback Chat to GoXLR System and verify real playback. Move explicit app selections from Loopback where found. Leave Loopback installed as rollback and document any unverified channels.

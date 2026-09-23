@@ -26,7 +26,7 @@ only for enabled routes to avoid spending CPU on unused channels.
 The driver exposes a writable CoreAudio plug-in property carrying the 17-bit
 enabled-route mask. The daemon persists the mask in Utility settings, applies
 it at startup and after changes, and refreshes it if CoreAudio reloads the
-plug-in. The UI source lives in the separate `goxlr-utility-ui` repository;
+plug-in. The UI source lives in the separate `goxlr-ui` repository;
 the existing daemon IPC and `DaemonConfig` settings path carries the switch
 state. The initial mask enables Microphone, System, Game, Chat, and Music.
 Live visibility changes must be proved on macOS before relying on this path.
