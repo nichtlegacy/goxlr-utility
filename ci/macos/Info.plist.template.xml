@@ -43,5 +43,8 @@
 
         <key>NSHighResolutionCapable</key>
         <true/>
+
+        <key>NSMicrophoneUsageDescription</key>
+        <string>GoXLR Utility needs microphone access to route GoXLR audio to the virtual Microphone device.</string>
     </dict>
 </plist>

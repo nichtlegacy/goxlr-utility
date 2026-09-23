@@ -5,6 +5,12 @@ This development build exposes three 48 kHz stereo devices: GoXLR Microphone
 daemon bridge is also required for audio to flow. Use the daemon built from this
 branch for a local test, after stopping the running installed daemon.
 
+Launch the daemon from a signed `.app` bundle with
+`NSMicrophoneUsageDescription` in its `Info.plist`, then grant that app
+Microphone access in macOS Privacy & Security. A daemon launched directly from
+a terminal may inherit the terminal app's permission instead. Without access,
+the bridge can start while the physical GoXLR input supplies only silence.
+
 Build and inspect without installing:
 
 ```sh
