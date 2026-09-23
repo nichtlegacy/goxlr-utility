@@ -14,6 +14,7 @@ use crate::platform::macos::core_audio::{
     find_all_existing_aggregates, get_goxlr_devices, set_active_channels,
 };
 use crate::platform::macos::device::{Inputs, Outputs};
+use crate::settings::SettingsHandle;
 use crate::shutdown::Shutdown;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
@@ -26,10 +27,14 @@ use tokio::{select, time};
    we'll destroy the devices. During runtime, we'll periodically check to see if new devices
    have appeared, or old devices have disappeared, and manage accordingly.
 */
-pub async fn run(tx: mpsc::Sender<EventTriggers>, mut stop: Shutdown) -> Result<()> {
+pub async fn run(
+    tx: mpsc::Sender<EventTriggers>,
+    settings: SettingsHandle,
+    mut stop: Shutdown,
+) -> Result<()> {
     let bridge_stop = stop.clone();
     tokio::spawn(async move {
-        if let Err(error) = audio_bridge::run(bridge_stop).await {
+        if let Err(error) = audio_bridge::run(settings, bridge_stop).await {
             warn!("GoXLR virtual audio bridge stopped: {error}");
         }
     });

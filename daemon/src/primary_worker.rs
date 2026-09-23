@@ -490,6 +490,13 @@ pub async fn spawn_usb_handler(
                                 change_found = true;
                                 let _ = sender.send(Ok(()));
                             }
+                            DaemonCommand::SetMacOSVirtualAudioRoutes(routes) => {
+                                settings.set_macos_virtual_audio_routes(routes).await;
+                                settings.save().await;
+
+                                change_found = true;
+                                let _ = sender.send(Ok(()));
+                            }
                         }
                     },
 
@@ -686,6 +693,7 @@ async fn get_daemon_status(
             },
             platform: env::consts::OS.to_string(),
             handle_macos_aggregates: settings.get_macos_handle_aggregates().await,
+            macos_virtual_audio_routes: settings.get_macos_virtual_audio_routes().await,
         },
         paths: Paths {
             profile_directory: settings.get_profile_directory().await,

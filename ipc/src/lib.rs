@@ -132,7 +132,11 @@ pub enum DaemonCommand {
     ApplySampleChange,
 
     HandleMacOSAggregates(bool),
+    SetMacOSVirtualAudioRoutes(u32),
 }
+
+pub const MACOS_DEFAULT_VIRTUAL_AUDIO_ROUTES: u32 = 0xF002;
+pub const MACOS_ALL_VIRTUAL_AUDIO_ROUTES: u32 = 0x1FFFF;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum GoXLRCommand {

@@ -1,7 +1,11 @@
 # Local macOS virtual driver build
 
-This development build exposes three 48 kHz stereo devices: GoXLR Microphone
-(input), GoXLR Chat (output), and GoXLR Music (output). GoXLR Utility's local
+This development build maps the GoXLR Full's five stereo playback pairs and
+23 capture channels to 17 selectable 48 kHz macOS devices. By default, only
+Microphone, System, Game, Chat, and Music are visible. The other devices can
+be shown or hidden live in GoXLR Utility settings. Dry Mic is mono; the other
+11 capture devices are stereo. The channel map is in
+`docs/plans/2026-09-23-macos-full-audio-design.md`. GoXLR Utility's local
 daemon bridge is also required for audio to flow. Use the daemon built from this
 branch for a local test, after stopping the running installed daemon.
 

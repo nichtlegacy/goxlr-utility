@@ -6,6 +6,14 @@
 #include <vector>
 
 int main() {
+    StereoHistory mono(8, 1);
+    const float monoInput[] = {1, 2, 3};
+    float monoOutput[] = {0, 0, 0};
+    StereoHistory::Cursor monoCursor;
+    mono.push(monoInput, 3);
+    mono.read(monoCursor, monoOutput, 3);
+    assert(monoOutput[0] == 1 && monoOutput[1] == 2 && monoOutput[2] == 3);
+
     StereoHistory history(128);
     std::vector<float> input(128 * 2);
     for (size_t frame = 0; frame < 128; ++frame) {

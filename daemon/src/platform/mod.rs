@@ -68,7 +68,7 @@ cfg_if! {
         }
 
         pub async fn spawn_runtime(state: DaemonState, tx: mpsc::Sender<EventTriggers>) -> Result<()> {
-            macos::runtime::run(tx.clone(), state.shutdown.clone()).await
+            macos::runtime::run(tx.clone(), state.settings_handle.clone(), state.shutdown.clone()).await
         }
 
         pub fn has_autostart() -> bool {

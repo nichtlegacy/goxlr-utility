@@ -41,6 +41,7 @@ pub struct DaemonConfig {
     pub open_ui_on_launch: bool,
     pub platform: String,
     pub handle_macos_aggregates: bool,
+    pub macos_virtual_audio_routes: u32,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

@@ -2,7 +2,10 @@ use crate::mic_profile::DEFAULT_MIC_PROFILE_NAME;
 use crate::profile::DEFAULT_PROFILE_NAME;
 use anyhow::{Context, Result};
 use directories::ProjectDirs;
-use goxlr_ipc::{FirmwareSource, GoXLRCommand, LogLevel};
+use goxlr_ipc::{
+    FirmwareSource, GoXLRCommand, LogLevel, MACOS_ALL_VIRTUAL_AUDIO_ROUTES,
+    MACOS_DEFAULT_VIRTUAL_AUDIO_ROUTES,
+};
 use goxlr_types::VodMode;
 use goxlr_types::VodMode::Routable;
 use log::{debug, error, info, warn};
@@ -62,6 +65,7 @@ impl SettingsHandle {
                 tts_enabled: Some(false),
                 allow_network_access: Some(false),
                 macos_handle_aggregates: None,
+                macos_virtual_audio_routes: None,
                 profile_directory: None,
                 mic_profile_directory: None,
                 samples_directory: None,
@@ -149,6 +153,13 @@ impl SettingsHandle {
         if settings.macos_handle_aggregates.is_none() {
             settings.macos_handle_aggregates = Some(true);
         }
+
+        settings.macos_virtual_audio_routes = Some(
+            settings
+                .macos_virtual_audio_routes
+                .unwrap_or(MACOS_DEFAULT_VIRTUAL_AUDIO_ROUTES)
+                & MACOS_ALL_VIRTUAL_AUDIO_ROUTES,
+        );
 
         if settings.devices.is_none() {
             settings.devices = Some(Default::default());
@@ -245,6 +256,16 @@ impl SettingsHandle {
     pub async fn get_macos_handle_aggregates(&self) -> bool {
         let settings = self.settings.read().await;
         settings.macos_handle_aggregates.unwrap()
+    }
+
+    pub async fn set_macos_virtual_audio_routes(&self, routes: u32) {
+        let mut settings = self.settings.write().await;
+        settings.macos_virtual_audio_routes = Some(routes & MACOS_ALL_VIRTUAL_AUDIO_ROUTES);
+    }
+
+    pub async fn get_macos_virtual_audio_routes(&self) -> u32 {
+        let settings = self.settings.read().await;
+        settings.macos_virtual_audio_routes.unwrap()
     }
 
     pub async fn get_profile_directory(&self) -> PathBuf {
@@ -707,6 +728,7 @@ pub struct Settings {
     tts_enabled: Option<bool>,
     allow_network_access: Option<bool>,
     macos_handle_aggregates: Option<bool>,
+    macos_virtual_audio_routes: Option<u32>,
     profile_directory: Option<PathBuf>,
     mic_profile_directory: Option<PathBuf>,
     samples_directory: Option<PathBuf>,

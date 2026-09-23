@@ -33,6 +33,8 @@ use io_kit_sys::{
 const CORE_AUDIO_UID: &str = "com.apple.audio.CoreAudio";
 const AGGREGATE_PREFIX: &str = "GoXLR-Utility::Aggregate";
 const LEGACY_PREFIX: &str = "com.adecorp.goxlr";
+const VIRTUAL_AUDIO_BUNDLE_ID: &str = "com.github.goxlr-on-linux.goxlr-virtual-audio";
+const VIRTUAL_AUDIO_ROUTES_SELECTOR: u32 = 0x67787274; // 'gxrt'
 
 fn uid_matches_location(uid: &str, location: u32) -> bool {
     let Some((prefix, _stream)) = uid.rsplit_once(':') else {
@@ -175,6 +177,34 @@ pub fn get_id_for_uid(uid: &str) -> anyhow::Result<AudioObjectID> {
         bail!("Error Fetching CoreAudio Plugin: {}", status);
     }
     Ok(plugin_id)
+}
+
+pub fn set_virtual_audio_routes(routes: u32) -> Result<()> {
+    let plugin = get_id_for_uid(VIRTUAL_AUDIO_BUNDLE_ID)?;
+    if plugin == kAudioObjectUnknown {
+        bail!("GoXLR virtual audio plug-in is not loaded");
+    }
+    let address = AudioObjectPropertyAddress {
+        mSelector: VIRTUAL_AUDIO_ROUTES_SELECTOR,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMaster,
+    };
+    let value = CFString::new(&format!("{routes:05X}"));
+    let value_ref = value.as_concrete_TypeRef();
+    let status = unsafe {
+        AudioObjectSetPropertyData(
+            plugin,
+            &address,
+            0,
+            null(),
+            mem::size_of::<CFStringRef>() as u32,
+            &value_ref as *const CFStringRef as *const c_void,
+        )
+    };
+    if status != kAudioHardwareNoError as i32 {
+        bail!("Unable to select GoXLR virtual audio routes: {status}");
+    }
+    Ok(())
 }
 
 pub fn get_uid_for_id(id: AudioObjectID) -> anyhow::Result<String> {
