@@ -8,6 +8,7 @@ use strum::IntoEnumIterator;
 
 use crate::HANDLE_MACOS_AGGREGATES;
 use crate::events::EventTriggers;
+use crate::platform::macos::audio_bridge;
 use crate::platform::macos::core_audio::{
     CoreAudioDevice, add_sub_device, create_aggregate_device, destroy_aggregate_device,
     find_all_existing_aggregates, get_goxlr_devices, set_active_channels,
@@ -26,6 +27,13 @@ use tokio::{select, time};
    have appeared, or old devices have disappeared, and manage accordingly.
 */
 pub async fn run(tx: mpsc::Sender<EventTriggers>, mut stop: Shutdown) -> Result<()> {
+    let bridge_stop = stop.clone();
+    tokio::spawn(async move {
+        if let Err(error) = audio_bridge::run(bridge_stop).await {
+            warn!("GoXLR virtual audio bridge stopped: {error}");
+        }
+    });
+
     // Before we start, we should destroy any existing aggregate devices as they're unmanaged.
     if let Ok(devices) = find_all_existing_aggregates() {
         for device in devices {

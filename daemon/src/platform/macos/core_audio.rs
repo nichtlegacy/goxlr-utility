@@ -17,10 +17,11 @@ use coreaudio_sys::{
     AudioObjectPropertyAddress, AudioObjectSetPropertyData, AudioValueTranslation, KERN_SUCCESS,
     kAudioAggregateDevicePropertyFullSubDeviceList, kAudioDevicePropertyDeviceUID,
     kAudioDevicePropertyPreferredChannelsForStereo, kAudioHardwareNoError,
-    kAudioHardwarePropertyDevices, kAudioHardwarePropertyPlugInForBundleID,
-    kAudioObjectPropertyElementMaster, kAudioObjectPropertyScopeGlobal,
-    kAudioObjectPropertyScopeInput, kAudioObjectPropertyScopeOutput, kAudioObjectSystemObject,
-    kAudioObjectUnknown, kAudioPlugInCreateAggregateDevice, kAudioPlugInDestroyAggregateDevice,
+    kAudioHardwarePropertyDeviceForUID, kAudioHardwarePropertyDevices,
+    kAudioHardwarePropertyPlugInForBundleID, kAudioObjectPropertyElementMaster,
+    kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyScopeInput,
+    kAudioObjectPropertyScopeOutput, kAudioObjectSystemObject, kAudioObjectUnknown,
+    kAudioPlugInCreateAggregateDevice, kAudioPlugInDestroyAggregateDevice,
 };
 use goxlr_usb::{PID_GOXLR_FULL, PID_GOXLR_MINI, VID_GOXLR};
 use io_kit_sys::types::io_iterator_t;
@@ -48,8 +49,16 @@ fn uid_matches_location(uid: &str, location: u32) -> bool {
 mod tests {
     use super::{
         StereoChannels, add_sub_device, create_aggregate_device, destroy_aggregate_device,
-        get_goxlr_devices, set_active_channels, uid_matches_location,
+        get_device_id_for_uid, get_goxlr_devices, set_active_channels, uid_matches_location,
     };
+
+    #[test]
+    fn unknown_audio_uid_has_no_device_id() {
+        assert_eq!(
+            get_device_id_for_uid("GoXLRVirtual::nonexistent-test-device").unwrap(),
+            None
+        );
+    }
 
     #[test]
     fn matches_only_the_exact_usb_location_component() {
@@ -113,6 +122,7 @@ mod tests {
 pub struct CoreAudioDevice {
     display_name: String,
     pub(crate) uid: String,
+    pub(crate) product_id: u16,
 }
 
 pub fn get_id_for_uid(uid: &str) -> anyhow::Result<AudioObjectID> {
@@ -199,6 +209,41 @@ pub fn get_uid_for_id(id: AudioObjectID) -> anyhow::Result<String> {
     };
 
     Ok(uid.to_string())
+}
+
+pub fn get_device_id_for_uid(uid: &str) -> Result<Option<AudioDeviceID>> {
+    let properties = AudioObjectPropertyAddress {
+        mSelector: kAudioHardwarePropertyDeviceForUID,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMaster,
+    };
+    let uid = CFString::new(uid);
+    let uid_ref = uid.as_concrete_TypeRef();
+    let mut device_id = kAudioObjectUnknown;
+    let mut translation = AudioValueTranslation {
+        mInputData: &uid_ref as *const CFStringRef as *mut c_void,
+        mInputDataSize: mem::size_of::<CFStringRef>() as u32,
+        mOutputData: &mut device_id as *mut AudioDeviceID as *mut c_void,
+        mOutputDataSize: mem::size_of::<AudioDeviceID>() as u32,
+    };
+    let mut size = mem::size_of::<AudioValueTranslation>() as u32;
+    let status = unsafe {
+        AudioObjectGetPropertyData(
+            kAudioObjectSystemObject,
+            &properties,
+            0,
+            ptr::null(),
+            &mut size,
+            &mut translation as *mut _ as *mut c_void,
+        )
+    };
+    if status != kAudioHardwareNoError as i32 {
+        bail!("CoreAudio UID lookup failed: {status}");
+    }
+    if device_id == kAudioObjectUnknown {
+        return Ok(None);
+    }
+    Ok(Some(device_id))
 }
 
 pub fn create_aggregate_device(channel: String, device: &CoreAudioDevice) -> Result<AudioDeviceID> {
@@ -503,6 +548,7 @@ pub fn get_goxlr_devices() -> Result<Vec<CoreAudioDevice>> {
                     "GoXLR Mini".into()
                 },
                 uid: uid.clone(),
+                product_id: pid as u16,
             });
         }
     }

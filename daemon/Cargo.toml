@@ -125,8 +125,10 @@ objc2 = "0.6.0"
 
 # Used for Aggregate Device Management
 coreaudio-sys = "0.2.15"
+coreaudio-rs = "0.13.0"
 core-foundation = "0.10.0"
 io-kit-sys = "0.4.1"
+rtrb = "0.4.0"
 
 [build-dependencies]
 clap = { workspace = true, features = ["derive"] }
