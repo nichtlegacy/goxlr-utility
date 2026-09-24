@@ -213,7 +213,8 @@ impl StereoReader {
 
         let backlog = self.queue.slots() as f32;
         let rate = (1.0 + (backlog - TARGET as f32) / TARGET as f32 * 0.002).clamp(0.998, 1.002);
-        for frame in output.chunks_exact_mut(channels) {
+        let mut frames = output.chunks_exact_mut(channels);
+        while let Some(frame) = frames.next() {
             frame[0] = self.current[0] + (self.next[0] - self.current[0]) * self.phase;
             if channels == 2 {
                 frame[1] = self.current[1] + (self.next[1] - self.current[1]) * self.phase;
@@ -222,7 +223,17 @@ impl StereoReader {
             while self.phase >= 1.0 {
                 self.phase -= 1.0;
                 self.current = self.next;
-                self.next = self.queue.pop().unwrap_or([0.0; 2]);
+                let Ok(next) = self.queue.pop() else {
+                    self.started = false;
+                    self.current = [0.0; 2];
+                    self.next = [0.0; 2];
+                    self.phase = 0.0;
+                    for frame in frames {
+                        frame.fill(0.0);
+                    }
+                    return;
+                };
+                self.next = next;
             }
         }
     }
@@ -548,5 +559,29 @@ mod tests {
         for (index, sample) in output.iter().enumerate() {
             assert!((*sample - index as f32).abs() < 0.1);
         }
+    }
+
+    #[test]
+    fn stereo_reader_rebuffers_after_underrun() {
+        let (mut producer, consumer) = RingBuffer::new(2048);
+        let mut reader = StereoReader::new(consumer);
+        for _ in 0..512 {
+            producer.push([1.0, -1.0]).unwrap();
+        }
+
+        let mut output = [0.0; 1024];
+        reader.fill(&mut output, 2);
+
+        for _ in 0..128 {
+            producer.push([2.0, -2.0]).unwrap();
+        }
+        reader.fill(&mut output, 2);
+        assert!(output.iter().all(|sample| *sample == 0.0));
+
+        for _ in 0..384 {
+            producer.push([2.0, -2.0]).unwrap();
+        }
+        reader.fill(&mut output, 2);
+        assert_eq!(&output[..2], &[2.0, -2.0]);
     }
 }
