@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if (( $# < 2 || $# > 3 )); then
+    echo "Usage: $0 /path/to/goxlr-utility-ui-wrapper-app /path/to/output [codesign-identity]" >&2
+    exit 2
+fi
+
+root=$(cd "$(dirname "$0")/.." && pwd)
+wrapper=$(cd "$1" && pwd)
+output=$2
+identity=${3:--}
+version=$(awk -F '"' '/^version = "/ { print $2; exit }' "$root/Cargo.toml")
+build_number=$(date +%Y%m%d.%H%M%S)
+app="$output/GoXLR Utility.app"
+driver="$output/GoXLRVirtual.driver"
+
+if [[ ! -f "$wrapper/src-tauri/Cargo.toml" || -z "$version" ]]; then
+    echo "Missing UI wrapper source or utility version" >&2
+    exit 1
+fi
+if [[ -e "$app" || -e "$driver" ]]; then
+    echo "Output already contains a GoXLR app or driver: $output" >&2
+    exit 1
+fi
+
+mkdir -p "$output"
+output=$(cd "$output" && pwd)
+app="$output/GoXLR Utility.app"
+driver="$output/GoXLRVirtual.driver"
+
+cargo build --manifest-path "$root/Cargo.toml" --release --all-features
+cargo build --manifest-path "$wrapper/src-tauri/Cargo.toml" \
+    --target-dir "$root/target" --release
+cmake -S "$root/macos/virtual-audio" -B "$output/driver-build" \
+    -DCMAKE_BUILD_TYPE=Release
+cmake --build "$output/driver-build"
+ctest --test-dir "$output/driver-build" --output-on-failure
+ditto "$output/driver-build/GoXLRVirtual.driver" "$driver"
+
+mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+for name in goxlr-client goxlr-daemon goxlr-defaults goxlr-initialiser goxlr-launcher goxlr-utility-ui; do
+    cp "$root/target/release/$name" "$app/Contents/MacOS/$name"
+    codesign --force --sign "$identity" --timestamp=none "$app/Contents/MacOS/$name"
+done
+cp "$root/daemon/resources/icon.icns" "$app/Contents/Resources/icon.icns"
+sed -e "s/{{VERSION}}/$version/g" -e "s/{{DATE}}/$build_number/g" \
+    "$root/ci/macos/Info.plist.template.xml" > "$app/Contents/Info.plist"
+
+helper="$app/Contents/Helpers/GoXLR Audio Bridge.app"
+mkdir -p "$helper/Contents/MacOS"
+cp "$root/target/release/goxlr-daemon" "$helper/Contents/MacOS/goxlr-daemon"
+sed -e "s/{{VERSION}}/$version/g" -e "s/{{DATE}}/$build_number/g" \
+    "$root/ci/macos/AudioBridge.Info.plist.template.xml" > "$helper/Contents/Info.plist"
+
+codesign --force --sign "$identity" --timestamp=none "$helper"
+codesign --force --sign "$identity" --timestamp=none "$driver"
+codesign --force --sign "$identity" --timestamp=none "$app"
+plutil -lint "$app/Contents/Info.plist" "$helper/Contents/Info.plist" "$driver/Contents/Info.plist"
+codesign --verify --deep --strict "$app"
+codesign --verify --strict "$driver"
+printf 'Built %s and %s\n' "$app" "$driver"
