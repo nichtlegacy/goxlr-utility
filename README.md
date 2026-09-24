@@ -7,6 +7,52 @@
 An unofficial tool to configure and control a TC-Helicon GoXLR or GoXLR Mini on Linux, MacOS and
 Windows. [Click Here](https://discord.gg/BRBjkkbvmZ) to join our discord!
 
+## This fork: virtual GoXLR audio on macOS
+
+This fork grew out of unreliable GoXLR audio routing on macOS 26 and 27. The GoXLR Full appears to
+macOS as one 23-channel input and one 10-channel output. Many apps need separate, selectable
+devices for the microphone and playback channels instead. The original utility can configure the
+GoXLR, but its macOS package does not provide those individual virtual audio devices. We needed a
+processed microphone for Discord and speech-to-text, plus separate System, Game, Chat, and Music
+outputs for app routing.
+
+### From Loopback to a built-in route
+
+Our temporary setup used [Rogue Amoeba Loopback](https://rogueamoeba.com/loopback/) to expose
+Microphone, Chat, Music, and System as Mac devices and route them to the GoXLR channels. That worked,
+but it required a separate routing app costing roughly US$100. We built the virtual devices into
+this fork so Loopback is no longer needed for these routes. An existing Loopback installation can
+remain as a fallback.
+
+### What this fork adds
+
+- A 48 kHz CoreAudio HAL plug-in, [GoXLRVirtual](macos/virtual-audio/), backed by libASPL. It
+  presents individual Mac input and output devices instead of making apps select channels from one
+  multichannel device.
+- A separate **GoXLR Audio Bridge** helper inside the Utility app. It reads the physical GoXLR's
+  capture channels and sends each enabled input route to its virtual device; in the other direction,
+  it combines virtual playback routes into the GoXLR's physical output channels. The helper has its
+  own macOS microphone permission. The audio bridge buffers short underruns to avoid broken-up
+  microphone audio.
+- USB vendor/product ID checks and the USB location ID to match the physical GoXLR to its CoreAudio
+  device unambiguously, including when device names are duplicated.
+- Switches in **System → Utility Settings** to show or hide optional routes immediately. The
+  settings panel is scrollable and has English and German labels. Only enabled routes run bridge
+  audio units. The selection is saved and restored when the daemon starts.
+
+The default devices are **GoXLR Microphone** (input) and **GoXLR System**, **Game**, **Chat**, and
+**Music** (outputs). The GoXLR Full's remaining capture routes and Sample output can be enabled in
+the Utility; Dry Mic is the only mono route. See the [complete channel map](docs/plans/2026-09-23-macos-full-audio-design.md#device-layout)
+for the physical channel assignments. This does not add a per-app output selector for apps that lack
+one; those apps use the macOS default output unless another routing tool is used.
+
+This implementation was built and tested locally with a GoXLR Full on macOS 27. macOS 26 motivated
+the work but has not been validated with this driver. The upstream release badges and downloads
+below refer to the original project: its `.pkg` does **not** include this fork's HAL driver and
+audio bridge. Build and install this fork locally using the [macOS virtual audio guide](macos/virtual-audio/README.md)
+and [`ci/build-macos-local`](ci/build-macos-local). The fork's UI switches also have source changes
+in the separate [goxlr-ui fork](https://github.com/nichtlegacy/goxlr-ui/tree/macos-virtual-audio-ui).
+
 ## Features
 
 * Full control over the GoXLR and GoXLR Mini (Similar to the official App)
