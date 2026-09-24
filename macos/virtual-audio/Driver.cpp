@@ -66,7 +66,10 @@ public:
         if (routeMask_.exchange(mask, std::memory_order_acq_rel) == mask) return;
         for (size_t i = 0; i < visibleDevices_.size(); ++i) {
             if (visibleDevices_[i]) {
-                visibleDevices_[i]->SetIsHidden((mask & (1u << i)) == 0);
+                const bool enabled = (mask & (1u << i)) != 0;
+                visibleDevices_[i]->SetCanBeDefaultDevice(enabled);
+                visibleDevices_[i]->SetCanBeDefaultSystemDevice(enabled);
+                visibleDevices_[i]->SetIsHidden(!enabled);
             }
         }
         NotifyPropertyChanged(kRouteMaskSelector);
