@@ -120,6 +120,17 @@ impl CpalConfiguration {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    pub(crate) fn get_outputs() -> Vec<String> {
+        super::macos_devices::device_names(false)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn get_inputs() -> Vec<String> {
+        super::macos_devices::device_names(true)
+    }
+
+    #[cfg(not(target_os = "macos"))]
     pub(crate) fn get_outputs() -> Vec<String> {
         let mut list: Vec<String> = vec![];
 
@@ -134,6 +145,7 @@ impl CpalConfiguration {
         list
     }
 
+    #[cfg(not(target_os = "macos"))]
     pub(crate) fn get_inputs() -> Vec<String> {
         let mut list: Vec<String> = vec![];
 

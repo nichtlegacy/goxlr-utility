@@ -37,3 +37,8 @@ libpulse-simple-binding = "2.28.1"
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 cpal = "0.16.0"
 rubato = "0.16.1"
+
+# On macOS, device names are read from the HAL directly to avoid cpal probing every device.
+[target.'cfg(target_os = "macos")'.dependencies]
+coreaudio-sys = "0.2.15"
+core-foundation = "0.10.0"

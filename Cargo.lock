@@ -1967,6 +1967,8 @@ name = "goxlr-audio"
 version = "1.2.4"
 dependencies = [
  "anyhow",
+ "core-foundation 0.10.1",
+ "coreaudio-sys",
  "cpal",
  "ebur128",
  "fancy-regex",
