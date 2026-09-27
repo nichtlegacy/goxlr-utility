@@ -235,7 +235,7 @@ pub fn get_uid_for_id(id: AudioObjectID) -> anyhow::Result<String> {
             bail!("Missing UID for {}", id);
         }
 
-        CFString::wrap_under_get_rule(uid)
+        CFString::wrap_under_create_rule(uid)
     };
 
     Ok(uid.to_string())

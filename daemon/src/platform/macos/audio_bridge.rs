@@ -5,10 +5,10 @@ use coreaudio::audio_unit::render_callback::{self, data};
 use coreaudio::audio_unit::{AudioUnit, Element, SampleFormat, Scope, StreamFormat};
 use coreaudio_sys::{AudioDeviceID, kAudioUnitProperty_StreamFormat};
 use goxlr_usb::PID_GOXLR_FULL;
-use log::{info, warn};
+use log::{debug, info, warn};
 use rtrb::{Consumer, RingBuffer};
 use std::time::Duration;
-use tokio::time;
+use tokio::time::{self, Instant};
 
 use crate::platform::macos::core_audio::{
     get_device_id_for_uid, get_goxlr_devices, set_virtual_audio_routes,
@@ -21,6 +21,7 @@ const INPUT_CHANNELS: usize = 23;
 const OUTPUT_CHANNELS: usize = 10;
 const CAPTURE_COUNT: usize = 12;
 const PLAYBACK_COUNT: usize = 5;
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy)]
 struct CaptureRoute {
@@ -400,6 +401,10 @@ pub async fn run(settings: SettingsHandle, mut stop: Shutdown) -> Result<()> {
     let mut ids: Option<VirtualIds> = None;
     let mut active: Option<Bridge> = None;
     let mut last_error: Option<String> = None;
+    // Each start attempt creates and starts up to 19 AudioUnits, so back off while the
+    // physical device keeps refusing to start (e.g. right after it was plugged back in).
+    let mut failures = 0u32;
+    let mut retry_at: Option<Instant> = None;
     let mut ticker = time::interval(Duration::from_secs(2));
     loop {
         tokio::select! {
@@ -448,6 +453,8 @@ pub async fn run(settings: SettingsHandle, mut stop: Shutdown) -> Result<()> {
                     .collect();
                 if full_devices.len() != 1 {
                     active = None;
+                    failures = 0;
+                    retry_at = None;
                     if full_devices.len() > 1 {
                         report_error(&mut last_error, "multiple GoXLR Full devices found".into());
                     }
@@ -469,14 +476,23 @@ pub async fn run(settings: SettingsHandle, mut stop: Shutdown) -> Result<()> {
                     let Some(physical_id) = physical_id else {
                         continue;
                     };
+                    if retry_at.is_some_and(|at| Instant::now() < at) {
+                        continue;
+                    }
                     match Bridge::start(physical_uid.clone(), physical_id, ids, routes) {
                         Ok(bridge) => {
                             info!("GoXLR virtual audio bridge started");
                             active = Some(bridge);
                             last_error = None;
+                            failures = 0;
+                            retry_at = None;
                         }
                         Err(error) => {
                             report_error(&mut last_error, error.to_string());
+                            failures += 1;
+                            let delay = MAX_RETRY_DELAY.min(Duration::from_secs(2 << failures.min(5)));
+                            debug!("Retrying GoXLR virtual audio bridge in {}s", delay.as_secs());
+                            retry_at = Some(Instant::now() + delay);
                         }
                     }
                 }
