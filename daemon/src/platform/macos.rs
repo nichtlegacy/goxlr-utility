@@ -1,3 +1,4 @@
+pub mod app_audio;
 mod audio_bridge;
 mod core_audio;
 mod device;

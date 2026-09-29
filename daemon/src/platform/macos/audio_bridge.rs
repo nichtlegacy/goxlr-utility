@@ -14,8 +14,11 @@ use tokio::runtime::Handle;
 use tokio::sync::oneshot;
 use tokio::time;
 
+use crate::platform::macos::app_audio::{
+    AppAudioHandle, AppAudioSnapshot, AudioApp, BridgeSignal, list_audio_apps, rules_string,
+};
 use crate::platform::macos::core_audio::{
-    get_device_id_for_uid, get_goxlr_devices, set_virtual_audio_routes,
+    get_device_id_for_uid, get_goxlr_devices, set_virtual_audio_app_rules, set_virtual_audio_routes,
 };
 use crate::settings::SettingsHandle;
 use crate::shutdown::Shutdown;
@@ -23,7 +26,7 @@ use crate::shutdown::Shutdown;
 const RING_FRAMES: usize = 2048;
 const INPUT_CHANNELS: usize = 23;
 const OUTPUT_CHANNELS: usize = 10;
-const CAPTURE_COUNT: usize = 12;
+pub(crate) const CAPTURE_COUNT: usize = 12;
 const PLAYBACK_COUNT: usize = 5;
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(60);
 const TICK: Duration = Duration::from_secs(2);
@@ -403,21 +406,28 @@ fn report_error(last_error: &mut Option<String>, message: String) {
     }
 }
 
-pub async fn run(settings: SettingsHandle, mut stop: Shutdown) -> Result<()> {
+pub async fn run(
+    settings: SettingsHandle,
+    app_audio: AppAudioHandle,
+    mut stop: Shutdown,
+) -> Result<()> {
     // CoreAudio HAL calls can block for seconds while coreaudiod is busy, so the bridge
     // lives on its own thread rather than stalling a tokio worker.
     let handle = Handle::current();
-    let (stop_tx, stop_rx) = std_mpsc::channel::<()>();
+    let (signal_tx, signal_rx) = std_mpsc::channel();
     let (done_tx, done_rx) = oneshot::channel();
+    app_audio.set_bridge(Some(signal_tx.clone()));
+    let bridge_apps = app_audio.clone();
     thread::Builder::new()
         .name("goxlr-audio-bridge".into())
         .spawn(move || {
-            bridge_loop(&handle, &settings, &stop_rx);
+            bridge_loop(&handle, &settings, &bridge_apps, &signal_rx);
             let _ = done_tx.send(());
         })?;
 
     stop.recv().await;
-    let _ = stop_tx.send(());
+    app_audio.set_bridge(None);
+    let _ = signal_tx.send(BridgeSignal::Stop);
 
     // Wait (bounded, in case the HAL is wedged) for the thread to stop the AudioUnits.
     if time::timeout(Duration::from_secs(5), done_rx)
@@ -429,7 +439,37 @@ pub async fn run(settings: SettingsHandle, mut stop: Shutdown) -> Result<()> {
     Ok(())
 }
 
-fn bridge_loop(handle: &Handle, settings: &SettingsHandle, stop: &std_mpsc::Receiver<()>) {
+// Publishes the app list for the tray and pushes the per-app rules to the plug-in when they
+// differ from what it was last given.
+fn sync_app_rules(
+    handle: &Handle,
+    settings: &SettingsHandle,
+    app_audio: &AppAudioHandle,
+    apps: &[AudioApp],
+    routes: u32,
+    applied: &mut Option<String>,
+) -> Result<()> {
+    let rules = handle.block_on(settings.get_macos_app_rules());
+    let value = rules_string(apps, &rules);
+    app_audio.publish(AppAudioSnapshot {
+        apps: apps.to_vec(),
+        rules,
+        routes,
+    });
+    if applied.as_deref() != Some(value.as_str()) {
+        *applied = None;
+        set_virtual_audio_app_rules(&value)?;
+        *applied = Some(value);
+    }
+    Ok(())
+}
+
+fn bridge_loop(
+    handle: &Handle,
+    settings: &SettingsHandle,
+    app_audio: &AppAudioHandle,
+    signals: &std_mpsc::Receiver<BridgeSignal>,
+) {
     let mut ids: Option<VirtualIds> = None;
     let mut active: Option<Bridge> = None;
     let mut last_error: Option<String> = None;
@@ -439,15 +479,37 @@ fn bridge_loop(handle: &Handle, settings: &SettingsHandle, stop: &std_mpsc::Rece
     // it every REAPPLY_ROUTES.
     let mut applied_routes: Option<u32> = None;
     let mut routes_applied_at = Instant::now();
+    // The per-app rules follow the same pattern: they're dropped whenever the route mask is
+    // (re)applied, so they're re-sent along with it.
+    let mut applied_app_rules: Option<String> = None;
+    let mut apps: Vec<AudioApp> = Vec::new();
     // Each start attempt creates and starts up to 19 AudioUnits, so back off while the
     // physical device keeps refusing to start (e.g. right after it was plugged back in).
     let mut failures = 0u32;
     let mut retry_at: Option<Instant> = None;
     let mut next_tick = Instant::now();
     // Tick every 2 seconds until a stop is sent (or the sender goes away).
-    while let Err(RecvTimeoutError::Timeout) =
-        stop.recv_timeout(next_tick.saturating_duration_since(Instant::now()))
-    {
+    loop {
+        match signals.recv_timeout(next_tick.saturating_duration_since(Instant::now())) {
+            Err(RecvTimeoutError::Timeout) => {}
+            Ok(BridgeSignal::Refresh) => {
+                // A rule changed in the tray, apply it to the apps we already know about.
+                if let Some(routes) = applied_routes
+                    && let Err(error) = sync_app_rules(
+                        handle,
+                        settings,
+                        app_audio,
+                        &apps,
+                        routes,
+                        &mut applied_app_rules,
+                    )
+                {
+                    report_error(&mut last_error, error.to_string());
+                }
+                continue;
+            }
+            Ok(BridgeSignal::Stop) | Err(RecvTimeoutError::Disconnected) => break,
+        }
         next_tick = Instant::now() + TICK;
 
         let current_ids = match virtual_ids() {
@@ -465,6 +527,8 @@ fn bridge_loop(handle: &Handle, settings: &SettingsHandle, stop: &std_mpsc::Rece
             ids = current_ids;
         }
         let Some(ids) = ids else {
+            apps.clear();
+            app_audio.publish(AppAudioSnapshot::default());
             continue;
         };
         let routes = handle.block_on(settings.get_macos_virtual_audio_routes());
@@ -477,6 +541,22 @@ fn bridge_loop(handle: &Handle, settings: &SettingsHandle, stop: &std_mpsc::Rece
             }
             applied_routes = Some(routes);
             routes_applied_at = Instant::now();
+            applied_app_rules = None;
+        }
+
+        match list_audio_apps() {
+            Ok(list) => apps = list,
+            Err(error) => debug!("Unable to list audio apps: {error}"),
+        }
+        if let Err(error) = sync_app_rules(
+            handle,
+            settings,
+            app_audio,
+            &apps,
+            routes,
+            &mut applied_app_rules,
+        ) {
+            report_error(&mut last_error, error.to_string());
         }
         if active
             .as_ref()

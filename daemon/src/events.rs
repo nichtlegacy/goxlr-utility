@@ -41,6 +41,14 @@ pub struct DaemonState {
 
     // Settings Handle..
     pub settings_handle: SettingsHandle,
+
+    // Device commands, status patches and per-app audio for the menubar
+    #[cfg(target_os = "macos")]
+    pub usb_tx: crate::primary_worker::DeviceSender,
+    #[cfg(target_os = "macos")]
+    pub broadcast_tx: tokio::sync::broadcast::Sender<crate::PatchEvent>,
+    #[cfg(target_os = "macos")]
+    pub app_audio: crate::platform::macos::app_audio::AppAudioHandle,
 }
 
 pub async fn spawn_event_handler(

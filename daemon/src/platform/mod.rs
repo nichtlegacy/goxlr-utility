@@ -61,14 +61,20 @@ cfg_if! {
             linux::display_error(message);
         }
     } else if #[cfg(target_os = "macos")] {
-        mod macos;
+        pub mod macos;
 
         pub fn perform_preflight() -> Result<()> {
             Ok(())
         }
 
         pub async fn spawn_runtime(state: DaemonState, tx: mpsc::Sender<EventTriggers>) -> Result<()> {
-            macos::runtime::run(tx.clone(), state.settings_handle.clone(), state.shutdown.clone()).await
+            macos::runtime::run(
+                tx.clone(),
+                state.settings_handle.clone(),
+                state.app_audio.clone(),
+                state.shutdown.clone(),
+            )
+            .await
         }
 
         pub fn has_autostart() -> bool {

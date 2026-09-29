@@ -35,6 +35,7 @@ const AGGREGATE_PREFIX: &str = "GoXLR-Utility::Aggregate";
 const LEGACY_PREFIX: &str = "com.adecorp.goxlr";
 const VIRTUAL_AUDIO_BUNDLE_ID: &str = "com.github.goxlr-on-linux.goxlr-virtual-audio";
 const VIRTUAL_AUDIO_ROUTES_SELECTOR: u32 = 0x67787274; // 'gxrt'
+const VIRTUAL_AUDIO_APP_RULES_SELECTOR: u32 = 0x67786170; // 'gxap'
 
 fn uid_matches_location(uid: &str, location: u32) -> bool {
     let Some((prefix, _stream)) = uid.rsplit_once(':') else {
@@ -180,16 +181,33 @@ pub fn get_id_for_uid(uid: &str) -> anyhow::Result<AudioObjectID> {
 }
 
 pub fn set_virtual_audio_routes(routes: u32) -> Result<()> {
+    set_virtual_audio_string(
+        VIRTUAL_AUDIO_ROUTES_SELECTOR,
+        &format!("{routes:05X}"),
+        "select GoXLR virtual audio routes",
+    )
+}
+
+/// Sets the per-app rules (`pid:route:gain` entries joined by `;`) on the plug-in.
+pub fn set_virtual_audio_app_rules(rules: &str) -> Result<()> {
+    set_virtual_audio_string(
+        VIRTUAL_AUDIO_APP_RULES_SELECTOR,
+        rules,
+        "set GoXLR per-app audio rules",
+    )
+}
+
+fn set_virtual_audio_string(selector: u32, value: &str, action: &str) -> Result<()> {
     let plugin = get_id_for_uid(VIRTUAL_AUDIO_BUNDLE_ID)?;
     if plugin == kAudioObjectUnknown {
         bail!("GoXLR virtual audio plug-in is not loaded");
     }
     let address = AudioObjectPropertyAddress {
-        mSelector: VIRTUAL_AUDIO_ROUTES_SELECTOR,
+        mSelector: selector,
         mScope: kAudioObjectPropertyScopeGlobal,
         mElement: kAudioObjectPropertyElementMaster,
     };
-    let value = CFString::new(&format!("{routes:05X}"));
+    let value = CFString::new(value);
     let value_ref = value.as_concrete_TypeRef();
     let status = unsafe {
         AudioObjectSetPropertyData(
@@ -202,7 +220,7 @@ pub fn set_virtual_audio_routes(routes: u32) -> Result<()> {
         )
     };
     if status != kAudioHardwareNoError as i32 {
-        bail!("Unable to select GoXLR virtual audio routes: {status}");
+        bail!("Unable to {action}: {status}");
     }
     Ok(())
 }

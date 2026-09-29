@@ -8,6 +8,7 @@ use strum::IntoEnumIterator;
 
 use crate::HANDLE_MACOS_AGGREGATES;
 use crate::events::EventTriggers;
+use crate::platform::macos::app_audio::AppAudioHandle;
 use crate::platform::macos::audio_bridge;
 use crate::platform::macos::core_audio::{
     CoreAudioDevice, add_sub_device, create_aggregate_device, destroy_aggregate_device,
@@ -31,11 +32,12 @@ use tokio::{select, time};
 pub async fn run(
     tx: mpsc::Sender<EventTriggers>,
     settings: SettingsHandle,
+    app_audio: AppAudioHandle,
     mut stop: Shutdown,
 ) -> Result<()> {
     let bridge_stop = stop.clone();
     let bridge = tokio::spawn(async move {
-        if let Err(error) = audio_bridge::run(settings, bridge_stop).await {
+        if let Err(error) = audio_bridge::run(settings, app_audio, bridge_stop).await {
             warn!("GoXLR virtual audio bridge stopped: {error}");
         }
     });

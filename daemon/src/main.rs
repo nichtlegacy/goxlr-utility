@@ -391,6 +391,13 @@ async fn run_utility() -> Result<()> {
 
         settings_handle: settings.clone(),
         http_settings: http_settings.clone(),
+
+        #[cfg(target_os = "macos")]
+        usb_tx: usb_tx.clone(),
+        #[cfg(target_os = "macos")]
+        broadcast_tx: broadcast_tx.clone(),
+        #[cfg(target_os = "macos")]
+        app_audio: Default::default(),
     };
 
     // Spawn the general event handler..

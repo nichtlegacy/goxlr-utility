@@ -66,6 +66,7 @@ impl SettingsHandle {
                 allow_network_access: Some(false),
                 macos_handle_aggregates: None,
                 macos_virtual_audio_routes: None,
+                macos_app_rules: None,
                 profile_directory: None,
                 mic_profile_directory: None,
                 samples_directory: None,
@@ -266,6 +267,22 @@ impl SettingsHandle {
     pub async fn get_macos_virtual_audio_routes(&self) -> u32 {
         let settings = self.settings.read().await;
         settings.macos_virtual_audio_routes.unwrap()
+    }
+
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub async fn get_macos_app_rules(&self) -> HashMap<String, MacosAppRule> {
+        let settings = self.settings.read().await;
+        settings.macos_app_rules.clone().unwrap_or_default()
+    }
+
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub async fn set_macos_app_rule(&self, bundle_id: String, rule: MacosAppRule) {
+        let mut settings = self.settings.write().await;
+        apply_app_rule(
+            settings.macos_app_rules.get_or_insert_default(),
+            bundle_id,
+            rule,
+        );
     }
 
     pub async fn get_profile_directory(&self) -> PathBuf {
@@ -729,6 +746,7 @@ pub struct Settings {
     allow_network_access: Option<bool>,
     macos_handle_aggregates: Option<bool>,
     macos_virtual_audio_routes: Option<u32>,
+    macos_app_rules: Option<HashMap<String, MacosAppRule>>,
     profile_directory: Option<PathBuf>,
     mic_profile_directory: Option<PathBuf>,
     samples_directory: Option<PathBuf>,
@@ -814,6 +832,40 @@ impl Settings {
     }
 }
 
+/// Per-app output routing on macOS, keyed by the app's bundle ID. `route` is a playback
+/// route index (System, Game, Chat, Music, Sample), `None` keeps the app's own output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MacosAppRule {
+    pub route: Option<usize>,
+    pub volume: u8,
+}
+
+impl Default for MacosAppRule {
+    fn default() -> Self {
+        Self {
+            route: None,
+            volume: 100,
+        }
+    }
+}
+
+/// Stores a rule, dropping it when it's equivalent to having no rule at all.
+pub fn apply_app_rule(
+    rules: &mut HashMap<String, MacosAppRule>,
+    bundle_id: String,
+    rule: MacosAppRule,
+) {
+    let rule = MacosAppRule {
+        route: rule.route.filter(|route| *route < 5),
+        volume: rule.volume.min(100),
+    };
+    if rule == MacosAppRule::default() {
+        rules.remove(&bundle_id);
+    } else {
+        rules.insert(bundle_id, rule);
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(default)]
 struct DeviceSettings {
@@ -867,5 +919,47 @@ impl Default for DeviceSettings {
             sleep_commands: vec![],
             wake_commands: vec![],
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MacosAppRule, apply_app_rule};
+    use std::collections::HashMap;
+
+    #[test]
+    fn default_app_rules_are_removed() {
+        let mut rules = HashMap::new();
+        let routed = MacosAppRule {
+            route: Some(3),
+            volume: 100,
+        };
+        apply_app_rule(&mut rules, "com.apple.Music".into(), routed);
+        apply_app_rule(
+            &mut rules,
+            "com.apple.Safari".into(),
+            MacosAppRule {
+                route: None,
+                volume: 40,
+            },
+        );
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules["com.apple.Music"], routed);
+
+        apply_app_rule(
+            &mut rules,
+            "com.apple.Music".into(),
+            MacosAppRule::default(),
+        );
+        // An unknown route falls back to the app's own output.
+        apply_app_rule(
+            &mut rules,
+            "com.apple.Safari".into(),
+            MacosAppRule {
+                route: Some(9),
+                volume: 100,
+            },
+        );
+        assert!(rules.is_empty());
     }
 }
