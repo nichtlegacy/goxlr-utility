@@ -42,6 +42,52 @@ pub struct DaemonConfig {
     pub platform: String,
     pub handle_macos_aggregates: bool,
     pub macos_virtual_audio_routes: u32,
+    #[serde(default)]
+    pub macos_app_audio: MacosAppAudio,
+}
+
+/// Per-app audio on macOS, empty on other platforms.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MacosAppAudio {
+    /// The apps coreaudiod currently knows about.
+    pub apps: Vec<MacosAudioApp>,
+    pub rules: HashMap<String, MacosAppRule>,
+    /// Display names of apps with a rule, remembered for when they aren't running.
+    pub names: HashMap<String, String>,
+    /// Bundle IDs left out of the app lists.
+    pub hidden: Vec<String>,
+    /// The enabled virtual audio route mask.
+    pub routes: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MacosAudioApp {
+    pub bundle_id: String,
+    pub name: String,
+    pub playing: bool,
+    /// The GoXLR playback route (0 - 4) the app plays to itself, if any.
+    pub device_route: Option<usize>,
+}
+
+/// Per-app output routing on macOS, keyed by the app's bundle ID. `route` is a playback
+/// route index (System, Game, Chat, Music, Sample), `None` keeps the app's own output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MacosAppRule {
+    pub route: Option<usize>,
+    /// Percent, from 0 to 200.
+    pub volume: u16,
+    #[serde(default)]
+    pub muted: bool,
+}
+
+impl Default for MacosAppRule {
+    fn default() -> Self {
+        Self {
+            route: None,
+            volume: 100,
+            muted: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

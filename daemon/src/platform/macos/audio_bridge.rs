@@ -457,9 +457,18 @@ fn sync_app_rules(
 ) -> Result<()> {
     let rules = handle.block_on(settings.get_macos_app_rules());
     let value = rules_string(apps, &rules);
+    // Keep the names of apps with rules, so the UI can list them while they aren't running.
+    let seen = apps
+        .iter()
+        .map(|app| (app.bundle_id.as_str(), app.name.as_str()));
+    if handle.block_on(settings.remember_macos_app_names(seen)) {
+        handle.block_on(settings.save());
+    }
     app_audio.publish(AppAudioSnapshot {
         apps: apps.to_vec(),
         rules,
+        names: handle.block_on(settings.get_macos_app_names()),
+        hidden: handle.block_on(settings.get_macos_hidden_apps()),
         routes,
     });
     // Compare with what the plug-in actually holds, a restarted coreaudiod reloads it empty.

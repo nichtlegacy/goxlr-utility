@@ -68,6 +68,23 @@ pub async fn handle_packet(
             }
         }
 
+        DaemonRequest::GetMacOSAppLevels => {
+            let (tx, rx) = oneshot::channel();
+            usb_tx
+                .send(DeviceCommand::GetMacOSAppLevels(tx))
+                .await
+                .map_err(|e| anyhow!(e.to_string()))
+                .context("Could not communicate with the device task")?;
+            let result = await_response(rx, RESPONSE_TIMEOUT)
+                .await
+                .context("Could not read the app levels")?;
+
+            match result {
+                Ok(levels) => Ok(DaemonResponse::MacOSAppLevels(levels)),
+                Err(e) => Ok(DaemonResponse::Error(e.to_string())),
+            }
+        }
+
         DaemonRequest::Command(serial, command) => {
             let (tx, rx) = oneshot::channel();
             usb_tx

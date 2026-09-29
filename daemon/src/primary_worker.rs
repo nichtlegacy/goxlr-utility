@@ -13,8 +13,8 @@ use anyhow::{Result, anyhow};
 use enum_map::EnumMap;
 use goxlr_ipc::{
     Activation, ColourWay, DaemonCommand, DaemonConfig, DaemonStatus, DriverDetails, Files,
-    FirmwareSource, FirmwareStatus, GoXLRCommand, HardwareStatus, HttpSettings, Locale, PathTypes,
-    Paths, SampleFile, UpdateState, UsbProductInformation,
+    FirmwareSource, FirmwareStatus, GoXLRCommand, HardwareStatus, HttpSettings, Locale,
+    MacosAppAudio, MacosAppRule, PathTypes, Paths, SampleFile, UpdateState, UsbProductInformation,
 };
 use goxlr_types::{DeviceType, FirmwareDetails, VersionNumber};
 use goxlr_usb::device::base::GoXLRDevice;
@@ -35,6 +35,7 @@ use xmltree::Element;
 
 const IGNORE_DEVICE_DURATION: Duration = Duration::from_secs(10);
 const APP_CHECK_INTERVAL: Duration = Duration::from_secs(30);
+const APP_RULES_SAVE_DELAY: Duration = Duration::from_millis(300);
 
 // Adding a third entry has tripped enum_variant_names, I'll probably need to rename
 // RunDeviceCommand, but that'll need to be in a separate commit, for now, suppress.
@@ -47,7 +48,15 @@ pub enum DeviceCommand {
     RunFirmwareUpdate(String, Option<PathBuf>, bool, oneshot::Sender<Result<()>>),
     ContinueFirmwareUpdate(String, oneshot::Sender<Result<()>>),
     ClearFirmwareState(String, oneshot::Sender<Result<()>>),
+    GetMacOSAppLevels(oneshot::Sender<Result<HashMap<String, f32>>>),
 }
+
+// The per-app audio state shared with the macOS audio bridge, nothing elsewhere.
+#[cfg(target_os = "macos")]
+pub type AppAudio = crate::platform::macos::app_audio::AppAudioHandle;
+#[cfg(not(target_os = "macos"))]
+#[derive(Clone, Default)]
+pub struct AppAudio;
 
 #[allow(dead_code)]
 pub enum DeviceStateChange {
@@ -78,6 +87,7 @@ pub async fn spawn_usb_handler(
     settings: SettingsHandle,
     http_settings: HttpSettings,
     mut file_manager: FileManager,
+    app_audio: AppAudio,
 ) {
     let mut firmware_version = None;
 
@@ -106,6 +116,10 @@ pub async fn spawn_usb_handler(
     let update_sleep = sleep(update_duration);
     tokio::pin!(update_sleep);
 
+    // Per-app rules apply immediately but are saved once changes settle, so a dragged volume
+    // slider doesn't rewrite the settings file on every step.
+    let mut app_rules_save_at: Option<tokio::time::Instant> = None;
+
     // Timer for checking whether the UI App has appeared
     let mut app_check: Option<String> = None;
     get_app_path(&mut app_check);
@@ -133,6 +147,7 @@ pub async fn spawn_usb_handler(
         &devices_firmware,
         files.clone(),
         &app_check,
+        &app_audio,
     )
     .await;
 
@@ -284,7 +299,15 @@ pub async fn spawn_usb_handler(
                         warn!("Error Received from {} while updating state: {}", device.serial(), error);
                     }
                 }
+                if app_rules_save_at.is_some_and(|at| tokio::time::Instant::now() >= at) {
+                    app_rules_save_at = None;
+                    settings.save().await;
+                }
                 update_sleep.as_mut().reset(tokio::time::Instant::now() + update_duration);
+            },
+            () = app_audio_changed(&app_audio) => {
+                // The apps playing audio, or their rules, changed on the audio bridge.
+                change_found = true;
             },
             () = &mut app_sleep => {
                 if get_app_path(&mut app_check) {
@@ -330,6 +353,11 @@ pub async fn spawn_usb_handler(
                             continue;
                         }
                         shutdown_triggered = true;
+
+                        // Don't lose a per-app rule change that hasn't been saved yet.
+                        if app_rules_save_at.take().is_some() {
+                            settings.save().await;
+                        }
 
                         // Flip through all the devices, send a shutdown signal..
                         for device in devices.values_mut() {
@@ -497,6 +525,27 @@ pub async fn spawn_usb_handler(
                                 change_found = true;
                                 let _ = sender.send(Ok(()));
                             }
+                            DaemonCommand::SetMacOSAppRule(bundle_id, route, volume, muted) => {
+                                let rule = MacosAppRule { route, volume, muted };
+                                set_app_rule(&settings, &app_audio, bundle_id, rule).await;
+                                app_rules_save_at = Some(tokio::time::Instant::now() + APP_RULES_SAVE_DELAY);
+                                change_found = true;
+                                let _ = sender.send(Ok(()));
+                            }
+                            DaemonCommand::RemoveMacOSAppRule(bundle_id) => {
+                                set_app_rule(&settings, &app_audio, bundle_id, MacosAppRule::default()).await;
+                                app_rules_save_at = Some(tokio::time::Instant::now() + APP_RULES_SAVE_DELAY);
+                                change_found = true;
+                                let _ = sender.send(Ok(()));
+                            }
+                            DaemonCommand::SetMacOSAppHidden(bundle_id, hidden) => {
+                                settings.set_macos_app_hidden(bundle_id, hidden).await;
+                                settings.save().await;
+                                hidden_apps_changed(&app_audio, settings.get_macos_hidden_apps().await);
+
+                                change_found = true;
+                                let _ = sender.send(Ok(()));
+                            }
                         }
                     },
 
@@ -524,6 +573,10 @@ pub async fn spawn_usb_handler(
                         } else {
                             let _ = sender.send(Err(anyhow!("Device {} is not connected", serial)));
                         }
+                    },
+
+                    DeviceCommand::GetMacOSAppLevels(sender) => {
+                        send_app_levels(&app_audio, sender);
                     },
 
                     DeviceCommand::RunFirmwareUpdate(serial, file, force, sender) => {
@@ -638,6 +691,7 @@ pub async fn spawn_usb_handler(
                 &devices_firmware,
                 files.clone(),
                 &app_check,
+                &app_audio,
             )
             .await;
 
@@ -669,6 +723,7 @@ async fn get_daemon_status(
     firmware_state: &HashMap<String, FirmwareUpdateState>,
     files: Files,
     app_check: &Option<String>,
+    app_audio: &AppAudio,
 ) -> DaemonStatus {
     let mut status = DaemonStatus {
         config: DaemonConfig {
@@ -694,6 +749,7 @@ async fn get_daemon_status(
             platform: env::consts::OS.to_string(),
             handle_macos_aggregates: settings.get_macos_handle_aggregates().await,
             macos_virtual_audio_routes: settings.get_macos_virtual_audio_routes().await,
+            macos_app_audio: get_app_audio_status(app_audio, settings).await,
         },
         paths: Paths {
             profile_directory: settings.get_profile_directory().await,
@@ -720,6 +776,74 @@ async fn get_daemon_status(
     }
 
     status
+}
+
+async fn get_app_audio_status(app_audio: &AppAudio, settings: &SettingsHandle) -> MacosAppAudio {
+    #[cfg(target_os = "macos")]
+    return crate::platform::macos::app_audio::app_audio_status(app_audio, settings).await;
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (app_audio, settings);
+        MacosAppAudio::default()
+    }
+}
+
+// Resolves whenever the macOS audio bridge saw a change in the apps or their rules, and never
+// on other platforms.
+async fn app_audio_changed(app_audio: &AppAudio) {
+    #[cfg(target_os = "macos")]
+    app_audio.changed().await;
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = app_audio;
+        std::future::pending::<()>().await;
+    }
+}
+
+// Stores a per-app rule and has the audio bridge apply it straight away.
+async fn set_app_rule(
+    settings: &SettingsHandle,
+    app_audio: &AppAudio,
+    bundle_id: String,
+    rule: MacosAppRule,
+) {
+    settings.set_macos_app_rule(bundle_id.clone(), rule).await;
+
+    #[cfg(target_os = "macos")]
+    app_audio.rule_changed(bundle_id, rule);
+
+    #[cfg(not(target_os = "macos"))]
+    let _ = (app_audio, bundle_id);
+}
+
+fn hidden_apps_changed(app_audio: &AppAudio, hidden: Vec<String>) {
+    #[cfg(target_os = "macos")]
+    app_audio.hidden_changed(hidden);
+
+    #[cfg(not(target_os = "macos"))]
+    let _ = (app_audio, hidden);
+}
+
+fn send_app_levels(app_audio: &AppAudio, sender: oneshot::Sender<Result<HashMap<String, f32>>>) {
+    // Reading the levels asks coreaudiod, which can block, so keep it off this task.
+    #[cfg(target_os = "macos")]
+    {
+        let app_audio = app_audio.clone();
+        tokio::spawn(async move {
+            let levels = tokio::task::spawn_blocking(move || app_audio.take_levels())
+                .await
+                .unwrap_or_else(|error| Err(anyhow!(error.to_string())));
+            let _ = sender.send(levels);
+        });
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = app_audio;
+        let _ = sender.send(Err(anyhow!("App levels are only available on macOS")));
+    }
 }
 
 #[allow(const_item_mutation)]

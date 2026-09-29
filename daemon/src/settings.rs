@@ -2,6 +2,7 @@ use crate::mic_profile::DEFAULT_MIC_PROFILE_NAME;
 use crate::profile::DEFAULT_PROFILE_NAME;
 use anyhow::{Context, Result};
 use directories::ProjectDirs;
+pub use goxlr_ipc::MacosAppRule;
 use goxlr_ipc::{
     FirmwareSource, GoXLRCommand, LogLevel, MACOS_ALL_VIRTUAL_AUDIO_ROUTES,
     MACOS_DEFAULT_VIRTUAL_AUDIO_ROUTES,
@@ -67,6 +68,8 @@ impl SettingsHandle {
                 macos_handle_aggregates: None,
                 macos_virtual_audio_routes: None,
                 macos_app_rules: None,
+                macos_app_names: None,
+                macos_hidden_apps: None,
                 profile_directory: None,
                 mic_profile_directory: None,
                 samples_directory: None,
@@ -275,14 +278,50 @@ impl SettingsHandle {
         settings.macos_app_rules.clone().unwrap_or_default()
     }
 
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub async fn set_macos_app_rule(&self, bundle_id: String, rule: MacosAppRule) {
         let mut settings = self.settings.write().await;
-        apply_app_rule(
-            settings.macos_app_rules.get_or_insert_default(),
-            bundle_id,
-            rule,
-        );
+        let rules = settings.macos_app_rules.get_or_insert_default();
+        apply_app_rule(rules, bundle_id.clone(), rule);
+        if !rules.contains_key(&bundle_id)
+            && let Some(names) = settings.macos_app_names.as_mut()
+        {
+            names.remove(&bundle_id);
+        }
+    }
+
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub async fn get_macos_app_names(&self) -> HashMap<String, String> {
+        let settings = self.settings.read().await;
+        settings.macos_app_names.clone().unwrap_or_default()
+    }
+
+    /// Remembers the display names of apps that have a rule, so they can be listed while they
+    /// aren't running. Returns whether anything changed.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub async fn remember_macos_app_names<'a>(
+        &self,
+        apps: impl IntoIterator<Item = (&'a str, &'a str)>,
+    ) -> bool {
+        let mut settings = self.settings.write().await;
+        let settings = &mut *settings;
+        let rules = settings.macos_app_rules.get_or_insert_default();
+        let names = settings.macos_app_names.get_or_insert_default();
+        remember_app_names(rules, names, apps)
+    }
+
+    pub async fn get_macos_hidden_apps(&self) -> Vec<String> {
+        let settings = self.settings.read().await;
+        settings.macos_hidden_apps.clone().unwrap_or_default()
+    }
+
+    pub async fn set_macos_app_hidden(&self, bundle_id: String, hidden: bool) {
+        let mut settings = self.settings.write().await;
+        let list = settings.macos_hidden_apps.get_or_insert_default();
+        list.retain(|entry| *entry != bundle_id);
+        if hidden {
+            list.push(bundle_id);
+            list.sort();
+        }
     }
 
     pub async fn get_profile_directory(&self) -> PathBuf {
@@ -747,6 +786,8 @@ pub struct Settings {
     macos_handle_aggregates: Option<bool>,
     macos_virtual_audio_routes: Option<u32>,
     macos_app_rules: Option<HashMap<String, MacosAppRule>>,
+    macos_app_names: Option<HashMap<String, String>>,
+    macos_hidden_apps: Option<Vec<String>>,
     profile_directory: Option<PathBuf>,
     mic_profile_directory: Option<PathBuf>,
     samples_directory: Option<PathBuf>,
@@ -832,23 +873,6 @@ impl Settings {
     }
 }
 
-/// Per-app output routing on macOS, keyed by the app's bundle ID. `route` is a playback
-/// route index (System, Game, Chat, Music, Sample), `None` keeps the app's own output.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MacosAppRule {
-    pub route: Option<usize>,
-    pub volume: u8,
-}
-
-impl Default for MacosAppRule {
-    fn default() -> Self {
-        Self {
-            route: None,
-            volume: 100,
-        }
-    }
-}
-
 /// Stores a rule, dropping it when it's equivalent to having no rule at all.
 pub fn apply_app_rule(
     rules: &mut HashMap<String, MacosAppRule>,
@@ -857,13 +881,32 @@ pub fn apply_app_rule(
 ) {
     let rule = MacosAppRule {
         route: rule.route.filter(|route| *route < 5),
-        volume: rule.volume.min(100),
+        volume: rule.volume.min(200),
+        muted: rule.muted,
     };
     if rule == MacosAppRule::default() {
         rules.remove(&bundle_id);
     } else {
         rules.insert(bundle_id, rule);
     }
+}
+
+// Updates the names of apps with a rule and forgets those whose rule is gone.
+fn remember_app_names<'a>(
+    rules: &HashMap<String, MacosAppRule>,
+    names: &mut HashMap<String, String>,
+    apps: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> bool {
+    let count = names.len();
+    names.retain(|bundle_id, _| rules.contains_key(bundle_id));
+    let mut changed = names.len() != count;
+    for (bundle_id, name) in apps {
+        if rules.contains_key(bundle_id) && names.get(bundle_id).map(String::as_str) != Some(name) {
+            names.insert(bundle_id.to_owned(), name.to_owned());
+            changed = true;
+        }
+    }
+    changed
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -924,27 +967,38 @@ impl Default for DeviceSettings {
 
 #[cfg(test)]
 mod tests {
-    use super::{MacosAppRule, apply_app_rule};
+    use super::{MacosAppRule, Settings, apply_app_rule, remember_app_names};
     use std::collections::HashMap;
+
+    fn rule(route: Option<usize>, volume: u16, muted: bool) -> MacosAppRule {
+        MacosAppRule {
+            route,
+            volume,
+            muted,
+        }
+    }
 
     #[test]
     fn default_app_rules_are_removed() {
         let mut rules = HashMap::new();
-        let routed = MacosAppRule {
-            route: Some(3),
-            volume: 100,
-        };
+        let routed = rule(Some(3), 100, false);
         apply_app_rule(&mut rules, "com.apple.Music".into(), routed);
+        apply_app_rule(&mut rules, "com.apple.Safari".into(), rule(None, 40, false));
         apply_app_rule(
             &mut rules,
-            "com.apple.Safari".into(),
-            MacosAppRule {
-                route: None,
-                volume: 40,
-            },
+            "com.spotify.client".into(),
+            rule(None, 100, true),
         );
-        assert_eq!(rules.len(), 2);
+        apply_app_rule(
+            &mut rules,
+            "com.example.Loud".into(),
+            rule(None, 250, false),
+        );
+        assert_eq!(rules.len(), 4);
         assert_eq!(rules["com.apple.Music"], routed);
+        assert!(rules["com.spotify.client"].muted);
+        // Volumes are capped at 200 %.
+        assert_eq!(rules["com.example.Loud"], rule(None, 200, false));
 
         apply_app_rule(
             &mut rules,
@@ -955,11 +1009,53 @@ mod tests {
         apply_app_rule(
             &mut rules,
             "com.apple.Safari".into(),
-            MacosAppRule {
-                route: Some(9),
-                volume: 100,
-            },
+            rule(Some(9), 100, false),
+        );
+        apply_app_rule(
+            &mut rules,
+            "com.spotify.client".into(),
+            rule(None, 100, false),
+        );
+        apply_app_rule(
+            &mut rules,
+            "com.example.Loud".into(),
+            rule(None, 100, false),
         );
         assert!(rules.is_empty());
+    }
+
+    #[test]
+    fn loads_app_rules_without_mute() {
+        let settings: Settings = serde_json::from_str(
+            r#"{
+                "show_tray_icon": true,
+                "macos_app_rules": {
+                    "com.apple.Music": { "route": 3, "volume": 35 },
+                    "com.apple.Safari": { "route": null, "volume": 100, "muted": true }
+                }
+            }"#,
+        )
+        .unwrap();
+        let rules = settings.macos_app_rules.unwrap();
+        assert_eq!(rules["com.apple.Music"], rule(Some(3), 35, false));
+        assert_eq!(rules["com.apple.Safari"], rule(None, 100, true));
+        assert_eq!(settings.macos_app_names, None);
+        assert_eq!(settings.macos_hidden_apps, None);
+    }
+
+    #[test]
+    fn remembers_names_of_apps_with_rules() {
+        let rules = HashMap::from([("com.spotify.client".to_string(), rule(Some(3), 100, false))]);
+        let mut names = HashMap::from([("com.apple.Music".to_string(), "Music".to_string())]);
+        let apps = [
+            ("com.spotify.client", "Spotify"),
+            ("com.apple.Safari", "Safari"),
+        ];
+        assert!(remember_app_names(&rules, &mut names, apps));
+        assert_eq!(
+            names,
+            HashMap::from([("com.spotify.client".to_string(), "Spotify".to_string())])
+        );
+        assert!(!remember_app_names(&rules, &mut names, apps));
     }
 }

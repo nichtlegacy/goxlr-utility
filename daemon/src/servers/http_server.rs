@@ -220,6 +220,12 @@ async fn websocket(
                                                         data: DaemonResponse::MicLevel(level),
                                                     })
                                                 }
+                                                DaemonResponse::MacOSAppLevels(levels) => {
+                                                    WsResponse(WebsocketResponse {
+                                                        id: request_id,
+                                                        data: DaemonResponse::MacOSAppLevels(levels),
+                                                    })
+                                                }
                                                 _ => {
                                                     // This should never fucking happen
                                                     break Some(CloseReason {

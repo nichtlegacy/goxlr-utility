@@ -11,9 +11,10 @@ use objc2::{
 };
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationOptions, NSApplicationActivationPolicy,
-    NSApplicationDelegate, NSCellImagePosition, NSControlStateValueOn, NSEvent,
+    NSApplicationDelegate, NSCellImagePosition, NSControl, NSControlStateValueOn, NSEvent,
     NSEventModifierFlags, NSEventSubtype, NSEventType, NSFont, NSImage, NSMenu, NSMenuDelegate,
-    NSMenuItem, NSRunningApplication, NSSlider, NSStatusBar, NSTextField, NSView, NSWorkspace,
+    NSMenuItem, NSResponder, NSRunningApplication, NSSlider, NSStatusBar, NSTextField, NSView,
+    NSWorkspace,
 };
 use objc2_foundation::{
     NSAutoreleasePool, NSData, NSDistributedNotificationCenter, NSNotification, NSNotificationName,
@@ -60,6 +61,12 @@ const PLAYBACK_CHANNELS: [ChannelName; 5] = [
 // App route items are tagged `app index * APP_TAG_STRIDE + route + 1`, 0 being the app's own output.
 const APP_TAG_STRIDE: usize = 8;
 
+// Per-app volumes run up to 200 %.
+const APP_VOLUME_MAX: f64 = 200.;
+
+// A mouse wheel notch moves a slider by this fraction of its range.
+const SCROLL_STEP: f64 = 1. / 50.;
+
 // Dragging a slider produces a stream of values, send at most one batch per interval.
 const COMMAND_INTERVAL: Duration = Duration::from_millis(30);
 const SAVE_DELAY: Duration = Duration::from_millis(300);
@@ -76,7 +83,8 @@ struct TrayDevice {
 struct PendingChanges {
     volumes: EnumMap<ChannelName, Option<u8>>,
     app_routes: HashMap<String, Option<usize>>,
-    app_volumes: HashMap<String, u8>,
+    app_volumes: HashMap<String, u16>,
+    app_mutes: HashMap<String, bool>,
 }
 
 // Shared by the AppKit main thread and the tray task. The main thread only ever holds these
@@ -142,8 +150,8 @@ async fn run_tray(mut p: RunParams) {
                 refresh_device(&p).await;
             },
             () = p.link.changed.notified() => {
-                let (routes, volumes) = apply_changes(&p).await;
-                if routes {
+                let (toggles, volumes) = apply_changes(&p).await;
+                if toggles {
                     save_at = None;
                     p.state.settings_handle.save().await;
                 } else if volumes {
@@ -205,7 +213,7 @@ async fn refresh_device(p: &RunParams) {
     *p.link.device.lock().unwrap() = device;
 }
 
-// Returns whether app routes and app volumes were changed, so the caller can save them.
+// Returns whether app routes or mutes, and app volumes were changed, so the caller can save them.
 async fn apply_changes(p: &RunParams) -> (bool, bool) {
     let changes = mem::take(&mut *p.link.pending.lock().unwrap());
 
@@ -236,6 +244,7 @@ async fn apply_changes(p: &RunParams) -> (bool, bool) {
         .app_routes
         .keys()
         .chain(changes.app_volumes.keys())
+        .chain(changes.app_mutes.keys())
         .collect();
     for bundle_id in bundle_ids {
         let mut rule = rules.get(bundle_id).copied().unwrap_or_default();
@@ -245,11 +254,14 @@ async fn apply_changes(p: &RunParams) -> (bool, bool) {
         if let Some(volume) = changes.app_volumes.get(bundle_id) {
             rule.volume = *volume;
         }
+        if let Some(muted) = changes.app_mutes.get(bundle_id) {
+            rule.muted = *muted;
+        }
         settings.set_macos_app_rule(bundle_id.clone(), rule).await;
         p.link.app_audio.rule_changed(bundle_id.clone(), rule);
     }
     (
-        !changes.app_routes.is_empty(),
+        !changes.app_routes.is_empty() || !changes.app_mutes.is_empty(),
         !changes.app_volumes.is_empty(),
     )
 }
@@ -561,7 +573,7 @@ define_class! {
 
     impl UtilityDelegate {
         #[unsafe(method(channelVolume:))]
-        fn channel_volume(&self, slider: &NSSlider) {
+        fn channel_volume(&self, slider: &ScrollSlider) {
             let channel = ChannelName::from_usize(slider.tag() as usize);
             let volume = slider.doubleValue().round() as u8;
             let link = &self.ivars().link;
@@ -585,13 +597,26 @@ define_class! {
         }
 
         #[unsafe(method(appVolume:))]
-        fn app_volume(&self, slider: &NSSlider) {
+        fn app_volume(&self, slider: &ScrollSlider) {
+            slider.update_label();
             let Some(bundle_id) = self.menu_app(slider.tag() as usize) else {
                 return;
             };
-            let volume = slider.doubleValue().round() as u8;
+            let volume = slider.doubleValue().round() as u16;
             let link = &self.ivars().link;
             link.pending.lock().unwrap().app_volumes.insert(bundle_id, volume);
+            link.changed.notify_one();
+        }
+
+        #[unsafe(method(appMute:))]
+        fn app_mute(&self, item: &NSMenuItem) {
+            let Some(bundle_id) = self.menu_app(item.tag() as usize) else {
+                return;
+            };
+            // The item shows the state the menu was built with, so toggle that.
+            let muted = item.state() != NSControlStateValueOn;
+            let link = &self.ivars().link;
+            link.pending.lock().unwrap().app_mutes.insert(bundle_id, muted);
             link.changed.notify_one();
         }
 
@@ -698,7 +723,7 @@ impl UtilityDelegate {
                     continue;
                 }
                 menu.addItem(&self.slider_item(
-                    PLAYBACK_NAMES[route],
+                    Some(PLAYBACK_NAMES[route]),
                     device.volumes[channel].into(),
                     255.,
                     sel!(channelVolume:),
@@ -713,8 +738,9 @@ impl UtilityDelegate {
             .apps
             .iter()
             .filter(|app| {
-                (app.playing && app.device_route.is_some())
-                    || snapshot.rules.contains_key(&app.bundle_id)
+                ((app.playing && app.device_route.is_some())
+                    || snapshot.rules.contains_key(&app.bundle_id))
+                    && !snapshot.hidden.contains(&app.bundle_id)
             })
             .collect();
         if apps.is_empty() {
@@ -754,16 +780,31 @@ impl UtilityDelegate {
                 submenu.addItem(&item);
             }
             submenu.addItem(&App::get_separator(mtm));
+            let mute = NSMenuItem::new(mtm);
+            mute.setTitle(&NSString::from_str("Mute"));
+            unsafe {
+                mute.setTarget(Some(self.as_ref()));
+                mute.setAction(Some(sel!(appMute:)));
+            }
+            mute.setTag(index as isize);
+            if rule.muted {
+                mute.setState(NSControlStateValueOn);
+            }
+            submenu.addItem(&mute);
             submenu.addItem(&self.slider_item(
-                "Volume",
+                None,
                 rule.volume.into(),
-                100.,
+                APP_VOLUME_MAX,
                 sel!(appVolume:),
                 index,
             ));
 
+            let muted = if rule.muted { ", muted" } else { "" };
             let item = NSMenuItem::new(mtm);
-            item.setTitle(&NSString::from_str(&format!("{} — {output}", app.name)));
+            item.setTitle(&NSString::from_str(&format!(
+                "{} — {output}{muted}",
+                app.name
+            )));
             item.setSubmenu(Some(&submenu));
             menu.addItem(&item);
         }
@@ -774,10 +815,11 @@ impl UtilityDelegate {
         App::add_static_items(mtm, menu);
     }
 
-    // A menu row holding a label and a continuous slider which sends `action` to us.
+    // A menu row holding a label and a continuous slider which sends `action` to us. Without a
+    // label, it shows the slider's value in percent.
     fn slider_item(
         &self,
-        label: &str,
+        label: Option<&str>,
         value: f64,
         max: f64,
         action: Sel,
@@ -787,29 +829,86 @@ impl UtilityDelegate {
         let frame = NSRect::new(NSPoint::new(0., 0.), NSSize::new(260., 28.));
         let view = NSView::initWithFrame(NSView::alloc(mtm), frame);
 
-        let text = NSTextField::labelWithString(&NSString::from_str(label), mtm);
+        let text = NSTextField::labelWithString(&NSString::from_str(label.unwrap_or("")), mtm);
         text.setFont(Some(&NSFont::menuFontOfSize(0.)));
         text.setFrame(NSRect::new(NSPoint::new(20., 5.), NSSize::new(62., 18.)));
 
+        let frame = NSRect::new(NSPoint::new(86., 4.), NSSize::new(158., 20.));
+        let slider = ScrollSlider::new(mtm, frame, label.is_none().then(|| text.clone()));
         let target: &AnyObject = self.as_ref();
-        let slider = unsafe {
-            NSSlider::sliderWithValue_minValue_maxValue_target_action(
-                value,
-                0.,
-                max,
-                Some(target),
-                Some(action),
-                mtm,
-            )
-        };
-        slider.setFrame(NSRect::new(NSPoint::new(86., 4.), NSSize::new(158., 20.)));
+        slider.setMinValue(0.);
+        slider.setMaxValue(max);
+        slider.setDoubleValue(value);
+        unsafe {
+            slider.setTarget(Some(target));
+            slider.setAction(Some(action));
+        }
         slider.setContinuous(true);
         slider.setTag(tag as isize);
+        slider.update_label();
 
         view.addSubview(&text);
         view.addSubview(&slider);
         let item = NSMenuItem::new(mtm);
         item.setView(Some(&view));
         item
+    }
+}
+
+pub(crate) struct SliderState {
+    // Shows the value in percent, for sliders without a name.
+    percent_label: Option<Retained<NSTextField>>,
+}
+
+define_class! {
+    // A menu slider that also follows the scroll wheel.
+    #[unsafe(super(NSSlider, NSControl, NSView, NSResponder, NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "GoXLRScrollSlider"]
+    #[ivars = SliderState]
+    pub(crate) struct ScrollSlider;
+
+    impl ScrollSlider {
+        #[unsafe(method(scrollWheel:))]
+        fn scroll_wheel(&self, event: &NSEvent) {
+            // Up (away from the user) raises the value, whatever the scroll direction setting.
+            let mut delta = event.scrollingDeltaY();
+            if event.isDirectionInvertedFromDevice() {
+                delta = -delta;
+            }
+            // Trackpads report points rather than wheel notches.
+            if event.hasPreciseScrollingDeltas() {
+                delta /= 10.;
+            }
+            let (min, max) = (self.minValue(), self.maxValue());
+            let current = self.doubleValue();
+            let value = (current + delta * (max - min) * SCROLL_STEP).clamp(min, max);
+            if value == current {
+                return;
+            }
+            self.setDoubleValue(value);
+            // Report it like a drag, so the change goes through the same path.
+            unsafe {
+                self.sendAction_to(self.action(), self.target().as_deref());
+            }
+        }
+    }
+}
+
+impl ScrollSlider {
+    fn new(
+        mtm: MainThreadMarker,
+        frame: NSRect,
+        percent_label: Option<Retained<NSTextField>>,
+    ) -> Retained<Self> {
+        let slider = mtm.alloc().set_ivars(SliderState { percent_label });
+        unsafe { msg_send![super(slider), initWithFrame: frame] }
+    }
+
+    fn update_label(&self) {
+        if let Some(label) = &self.ivars().percent_label {
+            let percent = self.doubleValue().round();
+            label.setStringValue(&NSString::from_str(&format!("{percent} %")));
+        }
     }
 }

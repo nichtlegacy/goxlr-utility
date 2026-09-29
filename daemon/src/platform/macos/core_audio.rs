@@ -36,6 +36,7 @@ const LEGACY_PREFIX: &str = "com.adecorp.goxlr";
 const VIRTUAL_AUDIO_BUNDLE_ID: &str = "com.github.goxlr-on-linux.goxlr-virtual-audio";
 const VIRTUAL_AUDIO_ROUTES_SELECTOR: u32 = 0x67787274; // 'gxrt'
 const VIRTUAL_AUDIO_APP_RULES_SELECTOR: u32 = 0x67786170; // 'gxap'
+const VIRTUAL_AUDIO_APP_LEVELS_SELECTOR: u32 = 0x67786c76; // 'gxlv'
 
 fn uid_matches_location(uid: &str, location: u32) -> bool {
     let Some((prefix, _stream)) = uid.rsplit_once(':') else {
@@ -206,6 +207,12 @@ pub fn get_virtual_audio_routes() -> Result<u32> {
 /// Reads back the per-app rules the plug-in is currently using.
 pub fn get_virtual_audio_app_rules() -> Result<String> {
     get_virtual_audio_string(VIRTUAL_AUDIO_APP_RULES_SELECTOR)
+}
+
+/// Reads (and resets) the peak level of each client since the last read, as `pid:peak`
+/// entries (per mille) joined by `;`.
+pub fn get_virtual_audio_app_levels() -> Result<String> {
+    get_virtual_audio_string(VIRTUAL_AUDIO_APP_LEVELS_SELECTOR)
 }
 
 fn get_virtual_audio_string(selector: u32) -> Result<String> {

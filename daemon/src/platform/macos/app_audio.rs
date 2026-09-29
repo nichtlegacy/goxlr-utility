@@ -16,12 +16,14 @@ use coreaudio_sys::{
     kAudioObjectPropertyScopeOutput, kAudioObjectSystemObject, kAudioProcessPropertyBundleID,
     kAudioProcessPropertyDevices, kAudioProcessPropertyIsRunningOutput, kAudioProcessPropertyPID,
 };
+use goxlr_ipc::{MacosAppAudio, MacosAudioApp};
 use objc2::rc::autoreleasepool;
 use objc2_app_kit::NSRunningApplication;
+use tokio::sync::Notify;
 
 use crate::platform::macos::audio_bridge::CAPTURE_COUNT;
-use crate::platform::macos::core_audio::get_uid_for_id;
-use crate::settings::{MacosAppRule, apply_app_rule};
+use crate::platform::macos::core_audio::{get_uid_for_id, get_virtual_audio_app_levels};
+use crate::settings::{MacosAppRule, SettingsHandle, apply_app_rule};
 
 /// The visible GoXLR playback devices, in playback route order.
 pub const PLAYBACK_NAMES: [&str; 5] = ["System", "Game", "Chat", "Music", "Sample"];
@@ -37,10 +39,12 @@ pub struct AudioApp {
 }
 
 /// What the bridge thread last saw, for the tray menu.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AppAudioSnapshot {
     pub apps: Vec<AudioApp>,
     pub rules: HashMap<String, MacosAppRule>,
+    pub names: HashMap<String, String>,
+    pub hidden: Vec<String>,
     pub routes: u32,
 }
 
@@ -115,6 +119,8 @@ extern "C" fn process_list_changed(
 pub struct AppAudioHandle {
     snapshot: Arc<Mutex<AppAudioSnapshot>>,
     bridge: Arc<Mutex<Option<Sender<BridgeSignal>>>>,
+    // Wakes the primary worker to refresh the daemon status when the snapshot changes.
+    changed: Arc<Notify>,
 }
 
 impl AppAudioHandle {
@@ -122,8 +128,18 @@ impl AppAudioHandle {
         self.snapshot.lock().unwrap().clone()
     }
 
+    /// Resolves once the snapshot has changed since the last call.
+    pub async fn changed(&self) {
+        self.changed.notified().await;
+    }
+
+    // The bridge publishes every tick, only wake the primary worker when something differs.
     pub(crate) fn publish(&self, snapshot: AppAudioSnapshot) {
-        *self.snapshot.lock().unwrap() = snapshot;
+        let mut current = self.snapshot.lock().unwrap();
+        if *current != snapshot {
+            *current = snapshot;
+            self.changed.notify_one();
+        }
     }
 
     pub(crate) fn set_bridge(&self, sender: Option<Sender<BridgeSignal>>) {
@@ -133,10 +149,71 @@ impl AppAudioHandle {
     /// Mirrors a rule that was just stored in the settings and wakes the bridge to apply it.
     pub fn rule_changed(&self, bundle_id: String, rule: MacosAppRule) {
         apply_app_rule(&mut self.snapshot.lock().unwrap().rules, bundle_id, rule);
+        self.changed.notify_one();
         if let Some(bridge) = self.bridge.lock().unwrap().as_ref() {
             let _ = bridge.send(BridgeSignal::Refresh);
         }
     }
+
+    /// Mirrors the hidden apps that were just stored in the settings.
+    pub fn hidden_changed(&self, hidden: Vec<String>) {
+        self.snapshot.lock().unwrap().hidden = hidden;
+        self.changed.notify_one();
+    }
+
+    /// Reads the peak level of each app since the last call, from 0 to 1. This asks
+    /// coreaudiod, so it can block.
+    pub fn take_levels(&self) -> Result<HashMap<String, f32>> {
+        let levels = get_virtual_audio_app_levels()?;
+        Ok(levels_by_app(&self.snapshot.lock().unwrap().apps, &levels))
+    }
+}
+
+/// The per-app audio part of the daemon status: the apps the bridge last saw, and the rules,
+/// names and hidden apps from the settings (so they show even while the driver is missing).
+pub async fn app_audio_status(
+    app_audio: &AppAudioHandle,
+    settings: &SettingsHandle,
+) -> MacosAppAudio {
+    let apps = app_audio
+        .snapshot()
+        .apps
+        .into_iter()
+        .map(|app| MacosAudioApp {
+            bundle_id: app.bundle_id,
+            name: app.name,
+            playing: app.playing,
+            device_route: app.device_route,
+        })
+        .collect();
+    MacosAppAudio {
+        apps,
+        rules: settings.get_macos_app_rules().await,
+        names: settings.get_macos_app_names().await,
+        hidden: settings.get_macos_hidden_apps().await,
+        routes: settings.get_macos_virtual_audio_routes().await,
+    }
+}
+
+/// Maps the plug-in's `pid:peak;..` levels (per mille) to the apps owning those processes,
+/// keeping the loudest process of each app.
+pub fn levels_by_app(apps: &[AudioApp], levels: &str) -> HashMap<String, f32> {
+    let mut result: HashMap<String, f32> = HashMap::new();
+    for entry in levels.split(';') {
+        let Some((pid, peak)) = entry.split_once(':') else {
+            continue;
+        };
+        let (Ok(pid), Ok(peak)) = (pid.trim().parse::<i32>(), peak.trim().parse::<u32>()) else {
+            continue;
+        };
+        let Some(app) = apps.iter().find(|app| app.pids.contains(&pid)) else {
+            continue;
+        };
+        let level = peak.min(1000) as f32 / 1000.0;
+        let value = result.entry(app.bundle_id.clone()).or_default();
+        *value = value.max(level);
+    }
+    result
 }
 
 pub fn playback_route_enabled(routes: u32, route: usize) -> bool {
@@ -159,7 +236,12 @@ pub fn rules_string(apps: &[AudioApp], rules: &HashMap<String, MacosAppRule>) ->
             Some(route) if route < PLAYBACK_NAMES.len() => route.to_string(),
             _ => "-".into(),
         };
-        let gain = u32::from(rule.volume.min(100)) * 10;
+        // Per mille, the plug-in soft limits anything above 1000.
+        let gain = if rule.muted {
+            0
+        } else {
+            u32::from(rule.volume.min(200)) * 10
+        };
         entries.extend(
             app.pids
                 .iter()
@@ -383,9 +465,18 @@ pub fn list_audio_apps() -> Result<Vec<AudioApp>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AudioApp, list_audio_apps, playback_route_for_uid, rules_string};
+    use super::{AudioApp, levels_by_app, list_audio_apps, playback_route_for_uid, rules_string};
     use crate::settings::MacosAppRule;
+    use goxlr_ipc::{MacosAppAudio, MacosAudioApp};
     use std::collections::HashMap;
+
+    fn rule(route: Option<usize>, volume: u16, muted: bool) -> MacosAppRule {
+        MacosAppRule {
+            route,
+            volume,
+            muted,
+        }
+    }
 
     fn app(bundle_id: &str, pids: Vec<i32>) -> AudioApp {
         AudioApp {
@@ -415,30 +506,75 @@ mod tests {
             app("com.apple.Music", vec![90]),
         ];
         let rules = HashMap::from([
-            (
-                "com.apple.Safari".to_string(),
-                MacosAppRule {
-                    route: Some(1),
-                    volume: 100,
-                },
-            ),
-            (
-                "com.apple.Music".to_string(),
-                MacosAppRule {
-                    route: None,
-                    volume: 35,
-                },
-            ),
+            ("com.apple.Safari".to_string(), rule(Some(1), 100, false)),
+            ("com.apple.Music".to_string(), rule(None, 35, false)),
             (
                 "com.example.NotRunning".to_string(),
-                MacosAppRule {
-                    route: Some(2),
-                    volume: 0,
-                },
+                rule(Some(2), 0, false),
             ),
         ]);
         assert_eq!(rules_string(&apps, &rules), "40:1:1000;90:-:350;512:1:1000");
         assert_eq!(rules_string(&apps, &HashMap::new()), "");
+    }
+
+    #[test]
+    fn maps_volume_and_mute_to_gain() {
+        let apps = [
+            app("com.spotify.client", vec![77]),
+            app("com.apple.Music", vec![90]),
+            app("com.apple.Safari", vec![12]),
+        ];
+        let rules = HashMap::from([
+            // Muted wins over the volume, and keeps the route.
+            ("com.spotify.client".to_string(), rule(Some(3), 150, true)),
+            ("com.apple.Music".to_string(), rule(None, 200, false)),
+            // Out of range volumes are capped at 200 %.
+            ("com.apple.Safari".to_string(), rule(None, 900, false)),
+        ]);
+        assert_eq!(rules_string(&apps, &rules), "12:-:2000;77:3:0;90:-:2000");
+    }
+
+    #[test]
+    fn maps_levels_to_apps() {
+        let apps = [
+            app("com.apple.Safari", vec![512, 40]),
+            app("com.spotify.client", vec![77]),
+        ];
+        let levels = levels_by_app(&apps, "40:250;512:600;77:1500;999:800;garbage;13:x");
+        assert_eq!(levels.len(), 2);
+        // The loudest process of an app wins, peaks are clamped to 1.
+        assert_eq!(levels["com.apple.Safari"], 0.6);
+        assert_eq!(levels["com.spotify.client"], 1.0);
+        assert!(levels_by_app(&apps, "").is_empty());
+    }
+
+    #[test]
+    fn serialises_status_like_the_web_ui_expects() {
+        let status = MacosAppAudio {
+            apps: vec![MacosAudioApp {
+                bundle_id: "com.spotify.client".into(),
+                name: "Spotify".into(),
+                playing: true,
+                device_route: Some(0),
+            }],
+            rules: HashMap::from([("com.spotify.client".to_string(), rule(Some(3), 100, false))]),
+            names: HashMap::from([("com.spotify.client".to_string(), "Spotify".to_string())]),
+            hidden: vec!["com.apple.siri".into()],
+            routes: 61442,
+        };
+        let value = serde_json::to_value(&status).unwrap();
+        println!("{value}");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "apps": [{"bundle_id": "com.spotify.client", "name": "Spotify", "playing": true,
+                          "device_route": 0}],
+                "rules": {"com.spotify.client": {"route": 3, "volume": 100, "muted": false}},
+                "names": {"com.spotify.client": "Spotify"},
+                "hidden": ["com.apple.siri"],
+                "routes": 61442
+            })
+        );
     }
 
     #[test]

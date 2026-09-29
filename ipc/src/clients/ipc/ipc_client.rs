@@ -49,6 +49,9 @@ impl Client for IPCClient {
             DaemonResponse::Patch(_patch) => {
                 Err(anyhow!("Received Patch as response, shouldn't happen!"))
             }
+            DaemonResponse::MacOSAppLevels(_levels) => Err(anyhow!(
+                "Received App Levels as response, shouldn't happen!"
+            )),
         }
     }
 

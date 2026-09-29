@@ -32,7 +32,7 @@ use crate::events::{DaemonState, EventTriggers, spawn_event_handler};
 use crate::files::{FileManager, spawn_file_notification_service};
 use crate::platform::perform_preflight;
 use crate::platform::spawn_runtime;
-use crate::primary_worker::spawn_usb_handler;
+use crate::primary_worker::{AppAudio, spawn_usb_handler};
 use crate::servers::http_server::spawn_http_server;
 use crate::servers::ipc_server::{bind_socket, spawn_ipc_server};
 use crate::settings::SettingsHandle;
@@ -322,6 +322,9 @@ async fn run_utility() -> Result<()> {
 
     let (ready_tx, ready_rx) = oneshot::channel();
 
+    // The per-app audio state on macOS, shared by the audio bridge, the tray and the status.
+    let app_audio: AppAudio = Default::default();
+
     // Start the USB Device Handler
     let usb_handle = tokio::spawn(spawn_usb_handler(
         usb_rx,
@@ -334,6 +337,7 @@ async fn run_utility() -> Result<()> {
         settings.clone(),
         http_settings.clone(),
         file_manager,
+        app_audio.clone(),
     ));
 
     // Wait until the handler is setup
@@ -397,7 +401,7 @@ async fn run_utility() -> Result<()> {
         #[cfg(target_os = "macos")]
         broadcast_tx: broadcast_tx.clone(),
         #[cfg(target_os = "macos")]
-        app_audio: Default::default(),
+        app_audio,
     };
 
     // Spawn the general event handler..

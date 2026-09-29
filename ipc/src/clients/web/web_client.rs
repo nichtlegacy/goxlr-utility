@@ -46,6 +46,9 @@ impl Client for WebClient {
             DaemonResponse::Patch(_patch) => {
                 bail!("Received Patch as response, shouldn't happen!")
             }
+            DaemonResponse::MacOSAppLevels(_levels) => {
+                bail!("Received App Levels as response, shouldn't happen!")
+            }
         }
     }
 

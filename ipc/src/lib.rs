@@ -1,6 +1,7 @@
 use enum_map::Enum;
 use json_patch::Patch;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 pub mod client;
@@ -29,6 +30,9 @@ pub enum DaemonRequest {
     RunFirmwareUpdate(String, Option<PathBuf>, bool),
     ContinueFirmwareUpdate(String),
     ClearFirmwareState(String),
+
+    // The peak level (0 to 1) of each app on the macOS virtual outputs since the last request.
+    GetMacOSAppLevels,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,6 +43,7 @@ pub enum DaemonResponse {
     MicLevel(f64),
     Status(DaemonStatus),
     Patch(Patch),
+    MacOSAppLevels(HashMap<String, f32>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -133,6 +138,11 @@ pub enum DaemonCommand {
 
     HandleMacOSAggregates(bool),
     SetMacOSVirtualAudioRoutes(u32),
+
+    // Bundle ID, route (None keeps the app's own output), volume percent (0 - 200), muted.
+    SetMacOSAppRule(String, Option<usize>, u16, bool),
+    RemoveMacOSAppRule(String),
+    SetMacOSAppHidden(String, bool),
 }
 
 pub const MACOS_DEFAULT_VIRTUAL_AUDIO_ROUTES: u32 = 0xF002;
