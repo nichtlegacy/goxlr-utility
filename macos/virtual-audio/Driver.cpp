@@ -120,6 +120,16 @@ private:
     const UInt32 channels_;
 };
 
+// macOS refuses Voice Isolation on virtual input devices and then reconfigures every input
+// device. Apps such as Discord answer by negotiating again, which loops and stalls coreaudiod.
+// These devices carry the GoXLR's USB audio, so report that transport instead.
+class GoXLRDevice final : public aspl::Device {
+public:
+    using aspl::Device::Device;
+
+    UInt32 GetTransportType() const override { return kAudioDeviceTransportTypeUSB; }
+};
+
 aspl::StreamParameters audioStream(aspl::Direction direction, UInt32 channels) {
     aspl::StreamParameters params;
     params.Direction = direction;
@@ -155,7 +165,7 @@ std::shared_ptr<aspl::Device> addDevice(const std::shared_ptr<aspl::Context>& co
     params.CanBeDefault = !hidden;
     params.CanBeDefaultForSystemSounds = !hidden;
 
-    auto device = std::make_shared<aspl::Device>(context, params);
+    auto device = std::make_shared<GoXLRDevice>(context, params);
     device->AddStreamAsync(audioStream(direction, channels));
     device->SetControlHandler(handler);
     device->SetIOHandler(handler);
