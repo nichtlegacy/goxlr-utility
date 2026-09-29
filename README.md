@@ -51,7 +51,8 @@ the work but has not been validated with this driver. The upstream release badge
 below refer to the original project: its `.pkg` does **not** include this fork's HAL driver and
 audio bridge. Build and install this fork locally using the [macOS virtual audio guide](macos/virtual-audio/README.md)
 and [`ci/build-macos-local`](ci/build-macos-local). The fork's UI switches also have source changes
-in the separate [goxlr-ui fork](https://github.com/nichtlegacy/goxlr-ui/tree/macos-virtual-audio-ui).
+in the separate [goxlr-ui fork](https://github.com/nichtlegacy/goxlr-ui/tree/macos-virtual-audio-ui), and the
+window's startup and reconnect fixes are in the [UI wrapper fork](https://github.com/nichtlegacy/goxlr-utility-ui-wrapper-app/tree/macos-ui-stability).
 
 ## Features
 

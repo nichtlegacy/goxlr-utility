@@ -13,8 +13,9 @@ opens the UI. The helper bundle includes `NSMicrophoneUsageDescription`.
 
 ## Build
 
-Clone `GoXLR-on-Linux/goxlr-utility-ui-wrapper-app` alongside this repository,
-then run:
+Clone the `macos-ui-stability` branch of
+[`nichtlegacy/goxlr-utility-ui-wrapper-app`](https://github.com/nichtlegacy/goxlr-utility-ui-wrapper-app/tree/macos-ui-stability)
+alongside this repository, then run:
 
 ```sh
 ./ci/build-macos-local ../goxlr-utility-ui-wrapper-app /tmp/goxlr-local-build
