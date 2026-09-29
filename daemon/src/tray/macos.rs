@@ -62,7 +62,7 @@ const APP_TAG_STRIDE: usize = 8;
 
 // Dragging a slider produces a stream of values, send at most one batch per interval.
 const COMMAND_INTERVAL: Duration = Duration::from_millis(30);
-const SAVE_DELAY: Duration = Duration::from_secs(1);
+const SAVE_DELAY: Duration = Duration::from_millis(300);
 
 #[derive(Clone)]
 struct TrayDevice {

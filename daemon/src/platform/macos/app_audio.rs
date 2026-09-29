@@ -8,8 +8,9 @@ use anyhow::{Result, bail};
 use core_foundation::base::TCFType;
 use core_foundation::string::{CFString, CFStringRef};
 use coreaudio_sys::{
-    AudioObjectGetPropertyData, AudioObjectGetPropertyDataSize, AudioObjectID,
-    AudioObjectPropertyAddress, AudioObjectPropertyScope, AudioObjectPropertySelector,
+    AudioObjectAddPropertyListener, AudioObjectGetPropertyData, AudioObjectGetPropertyDataSize,
+    AudioObjectID, AudioObjectPropertyAddress, AudioObjectPropertyScope,
+    AudioObjectPropertySelector, AudioObjectRemovePropertyListener, OSStatus,
     kAudioHardwareNoError, kAudioHardwarePropertyProcessObjectList,
     kAudioObjectPropertyElementMaster, kAudioObjectPropertyScopeGlobal,
     kAudioObjectPropertyScopeOutput, kAudioObjectSystemObject, kAudioProcessPropertyBundleID,
@@ -47,6 +48,67 @@ pub(crate) enum BridgeSignal {
     Stop,
     // Re-apply the per-app rules now, rather than on the next tick.
     Refresh,
+    // coreaudiod's process list changed, so an app may have started or stopped using audio.
+    AppsChanged,
+}
+
+const PROCESS_LIST: AudioObjectPropertyAddress = AudioObjectPropertyAddress {
+    mSelector: kAudioHardwarePropertyProcessObjectList,
+    mScope: kAudioObjectPropertyScopeGlobal,
+    mElement: kAudioObjectPropertyElementMaster,
+};
+
+/// Wakes the bridge whenever coreaudiod's process list changes. An app joins that list when it
+/// first opens audio, usually before it plays, so its rule can be in place from the first buffer.
+pub(crate) struct ProcessWatch {
+    sender: *mut Sender<BridgeSignal>,
+}
+
+// The sender is only touched by the listener and freed after the listener is removed.
+unsafe impl Send for ProcessWatch {}
+
+impl ProcessWatch {
+    pub(crate) fn new(sender: Sender<BridgeSignal>) -> Result<Self> {
+        let sender = Box::into_raw(Box::new(sender));
+        let status = unsafe {
+            AudioObjectAddPropertyListener(
+                kAudioObjectSystemObject,
+                &PROCESS_LIST,
+                Some(process_list_changed),
+                sender.cast(),
+            )
+        };
+        if status != kAudioHardwareNoError as i32 {
+            drop(unsafe { Box::from_raw(sender) });
+            bail!("Unable to watch CoreAudio processes: {status}");
+        }
+        Ok(Self { sender })
+    }
+}
+
+impl Drop for ProcessWatch {
+    fn drop(&mut self) {
+        unsafe {
+            AudioObjectRemovePropertyListener(
+                kAudioObjectSystemObject,
+                &PROCESS_LIST,
+                Some(process_list_changed),
+                self.sender.cast(),
+            );
+            drop(Box::from_raw(self.sender));
+        }
+    }
+}
+
+extern "C" fn process_list_changed(
+    _object: AudioObjectID,
+    _count: u32,
+    _addresses: *const AudioObjectPropertyAddress,
+    data: *mut c_void,
+) -> OSStatus {
+    let sender = unsafe { &*(data as *const Sender<BridgeSignal>) };
+    let _ = sender.send(BridgeSignal::AppsChanged);
+    kAudioHardwareNoError as OSStatus
 }
 
 #[derive(Clone, Default)]

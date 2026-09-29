@@ -197,6 +197,46 @@ pub fn set_virtual_audio_app_rules(rules: &str) -> Result<()> {
     )
 }
 
+/// Reads back the route mask the plug-in is currently using.
+pub fn get_virtual_audio_routes() -> Result<u32> {
+    let value = get_virtual_audio_string(VIRTUAL_AUDIO_ROUTES_SELECTOR)?;
+    Ok(u32::from_str_radix(&value, 16)?)
+}
+
+/// Reads back the per-app rules the plug-in is currently using.
+pub fn get_virtual_audio_app_rules() -> Result<String> {
+    get_virtual_audio_string(VIRTUAL_AUDIO_APP_RULES_SELECTOR)
+}
+
+fn get_virtual_audio_string(selector: u32) -> Result<String> {
+    let plugin = get_id_for_uid(VIRTUAL_AUDIO_BUNDLE_ID)?;
+    if plugin == kAudioObjectUnknown {
+        bail!("GoXLR virtual audio plug-in is not loaded");
+    }
+    let address = AudioObjectPropertyAddress {
+        mSelector: selector,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMaster,
+    };
+    let mut value: CFStringRef = null();
+    let mut size = mem::size_of::<CFStringRef>() as u32;
+    let status = unsafe {
+        AudioObjectGetPropertyData(
+            plugin,
+            &address,
+            0,
+            null(),
+            &mut size,
+            &mut value as *mut CFStringRef as *mut c_void,
+        )
+    };
+    if status != kAudioHardwareNoError as i32 || value.is_null() {
+        bail!("Unable to read GoXLR virtual audio property: {status}");
+    }
+    // The plug-in hands out a newly created string.
+    Ok(unsafe { CFString::wrap_under_create_rule(value) }.to_string())
+}
+
 fn set_virtual_audio_string(selector: u32, value: &str, action: &str) -> Result<()> {
     let plugin = get_id_for_uid(VIRTUAL_AUDIO_BUNDLE_ID)?;
     if plugin == kAudioObjectUnknown {

@@ -15,10 +15,12 @@ use tokio::sync::oneshot;
 use tokio::time;
 
 use crate::platform::macos::app_audio::{
-    AppAudioHandle, AppAudioSnapshot, AudioApp, BridgeSignal, list_audio_apps, rules_string,
+    AppAudioHandle, AppAudioSnapshot, AudioApp, BridgeSignal, ProcessWatch, list_audio_apps,
+    rules_string,
 };
 use crate::platform::macos::core_audio::{
-    get_device_id_for_uid, get_goxlr_devices, set_virtual_audio_app_rules, set_virtual_audio_routes,
+    get_device_id_for_uid, get_goxlr_devices, get_virtual_audio_app_rules,
+    get_virtual_audio_routes, set_virtual_audio_app_rules, set_virtual_audio_routes,
 };
 use crate::settings::SettingsHandle;
 use crate::shutdown::Shutdown;
@@ -30,7 +32,6 @@ pub(crate) const CAPTURE_COUNT: usize = 12;
 const PLAYBACK_COUNT: usize = 5;
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(60);
 const TICK: Duration = Duration::from_secs(2);
-const REAPPLY_ROUTES: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy)]
 struct CaptureRoute {
@@ -418,9 +419,14 @@ pub async fn run(
     let (done_tx, done_rx) = oneshot::channel();
     app_audio.set_bridge(Some(signal_tx.clone()));
     let bridge_apps = app_audio.clone();
+    let watch_tx = signal_tx.clone();
     thread::Builder::new()
         .name("goxlr-audio-bridge".into())
         .spawn(move || {
+            // Without the watch, new apps still get their rules on the next tick.
+            let _watch = ProcessWatch::new(watch_tx)
+                .map_err(|error| warn!("{error}"))
+                .ok();
             bridge_loop(&handle, &settings, &bridge_apps, &signal_rx);
             let _ = done_tx.send(());
         })?;
@@ -456,9 +462,13 @@ fn sync_app_rules(
         rules,
         routes,
     });
-    if applied.as_deref() != Some(value.as_str()) {
+    // Compare with what the plug-in actually holds, a restarted coreaudiod reloads it empty.
+    if applied.as_deref() != Some(value.as_str())
+        || get_virtual_audio_app_rules().ok().as_deref() != Some(value.as_str())
+    {
         *applied = None;
         set_virtual_audio_app_rules(&value)?;
+        debug!("Applied per-app audio rules: {value:?}");
         *applied = Some(value);
     }
     Ok(())
@@ -473,14 +483,10 @@ fn bridge_loop(
     let mut ids: Option<VirtualIds> = None;
     let mut active: Option<Bridge> = None;
     let mut last_error: Option<String> = None;
-    // Only push the route mask to the plug-in when it changes, or when the plug-in has
-    // been (re)found or errored, rather than on every tick. A restarted coreaudiod can hand
-    // out the same object ids with the plug-in back at its default mask, so also re-apply
-    // it every REAPPLY_ROUTES.
+    // Only push the route mask and per-app rules to the plug-in when they change, or when
+    // reading them back shows the plug-in lost them: a restarted coreaudiod can hand out the
+    // same object ids with the plug-in back at its defaults.
     let mut applied_routes: Option<u32> = None;
-    let mut routes_applied_at = Instant::now();
-    // The per-app rules follow the same pattern: they're dropped whenever the route mask is
-    // (re)applied, so they're re-sent along with it.
     let mut applied_app_rules: Option<String> = None;
     let mut apps: Vec<AudioApp> = Vec::new();
     // Each start attempt creates and starts up to 19 AudioUnits, so back off while the
@@ -492,8 +498,15 @@ fn bridge_loop(
     loop {
         match signals.recv_timeout(next_tick.saturating_duration_since(Instant::now())) {
             Err(RecvTimeoutError::Timeout) => {}
-            Ok(BridgeSignal::Refresh) => {
-                // A rule changed in the tray, apply it to the apps we already know about.
+            Ok(signal @ (BridgeSignal::Refresh | BridgeSignal::AppsChanged)) => {
+                // A rule changed in the tray (apply it to the apps we already know about), or
+                // an app started or stopped using audio (list them again first).
+                if matches!(signal, BridgeSignal::AppsChanged) {
+                    match list_audio_apps() {
+                        Ok(list) => apps = list,
+                        Err(error) => debug!("Unable to list audio apps: {error}"),
+                    }
+                }
                 if let Some(routes) = applied_routes
                     && let Err(error) = sync_app_rules(
                         handle,
@@ -532,7 +545,7 @@ fn bridge_loop(
             continue;
         };
         let routes = handle.block_on(settings.get_macos_virtual_audio_routes());
-        if applied_routes != Some(routes) || routes_applied_at.elapsed() >= REAPPLY_ROUTES {
+        if applied_routes != Some(routes) || get_virtual_audio_routes().ok() != Some(routes) {
             if let Err(error) = set_virtual_audio_routes(routes) {
                 active = None;
                 applied_routes = None;
@@ -540,7 +553,6 @@ fn bridge_loop(
                 continue;
             }
             applied_routes = Some(routes);
-            routes_applied_at = Instant::now();
             applied_app_rules = None;
         }
 
