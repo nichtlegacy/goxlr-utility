@@ -28,7 +28,8 @@ int main() {
     assert((*rules)[1].route == kKeepRoute && (*rules)[1].gain == kUnityGain);
     assert(parseRules("")->empty());
     assert(!parseRules("101:5:500"));
-    assert(!parseRules("101:1:1001"));
+    assert(parseRules("101:1:2000") && (*parseRules("101:1:2000"))[0].gain == kMaxGain);
+    assert(!parseRules("101:1:2001"));
     assert(!parseRules("0:1:500"));
     assert(!parseRules("abc:1:500"));
     assert(!parseRules("101:1"));
@@ -102,6 +103,58 @@ int main() {
     lagging.mixInjected(1, gameCursors, game.data(), 4, scratch.data());
     assert(gameCursors.fromRoute[0].nextFrame == 12 * 256 - kResyncLag + 4);
     assert(game[0] == 11.0f);
+
+    // Boost is exact below the limiter's knee and stays between the knee and 1.0 above it;
+    // mute writes exact zeros, also for a moved client.
+    Router boosted;
+    boosted.setRules({{60, kKeepRoute, 2000}, {70, kKeepRoute, 0}, {80, 2, 0}});
+    auto soft = constant(4, 0.3f, -0.3f);
+    boosted.processClientOutput(0, 60, soft.data(), 4, 0, kAllRoutes);
+    assert(soft == constant(4, 0.3f * 2.0f, -0.3f * 2.0f));
+    auto loud = constant(4, 0.9f, -0.9f);
+    boosted.processClientOutput(0, 60, loud.data(), 4, 0, kAllRoutes);
+    for (uint32_t i = 0; i < 8; ++i) {
+        const float magnitude = i % 2 == 0 ? loud[i] : -loud[i];
+        assert(magnitude > kLimiterKnee && magnitude < 1.0f);
+    }
+    assert(softLimit(100.0f) <= 1.0f && softLimit(-100.0f) >= -1.0f);
+    auto muted = constant(4, 0.5f, -0.5f);
+    boosted.processClientOutput(0, 70, muted.data(), 4, 0, kAllRoutes);
+    assert(muted == constant(4, 0, 0));
+    auto chatOfMuted = boosted.cursorsFor(2);
+    auto mutedMoved = constant(4, 0.5f, -0.5f);
+    boosted.processClientOutput(0, 80, mutedMoved.data(), 4, 1024, kAllRoutes);
+    boosted.flush(0, 1024);
+    assert(mutedMoved == constant(4, 0, 0));
+    auto chatSilent = constant(4, 0, 0);
+    boosted.mixInjected(2, chatOfMuted, chatSilent.data(), 4, scratch.data());
+    assert(chatSilent == constant(4, 0, 0));
+
+    // Levels are recorded after gain for clients with and without rules, keep the peak, leave
+    // out muted clients, clamp to 1000, and reset once read.
+    Router metered;
+    metered.setRules({{10, kKeepRoute, 500}, {20, 2, 1000}, {30, kKeepRoute, 0}});
+    auto plain = constant(4, 0.25f, -0.5f);
+    metered.processClientOutput(0, 99, plain.data(), 4, 0, kAllRoutes);
+    auto louder = constant(4, 0.1f, 0.75f);
+    metered.processClientOutput(1, 99, louder.data(), 4, 0, kAllRoutes);
+    auto halved = constant(4, 1, -1);
+    metered.processClientOutput(0, 10, halved.data(), 4, 0, kAllRoutes);
+    auto moved = constant(4, 0.2f, 0);
+    metered.processClientOutput(0, 20, moved.data(), 4, 0, kAllRoutes);
+    auto silenced = constant(4, 1, 1);
+    metered.processClientOutput(0, 30, silenced.data(), 4, 0, kAllRoutes);
+    auto clipping = constant(4, 3, 0);
+    metered.processClientOutput(0, 40, clipping.data(), 4, 0, kAllRoutes);
+    assert(metered.takeLevels() == "99:750;10:500;20:200;40:1000;");
+    assert(metered.takeLevels().empty());
+
+    // The same PID from two slots (a take racing a record) is merged to its highest peak.
+    LevelTable levels;
+    levels.record(5, 300);
+    levels.record(5, 100);
+    levels.record(6, 0);
+    assert(levels.take() == "5:300;");
 
     return 0;
 }

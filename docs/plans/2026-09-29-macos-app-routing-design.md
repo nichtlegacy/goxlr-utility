@@ -80,3 +80,74 @@ Input routing, per-app EQ, and routing apps that play to non-GoXLR devices
   GoXLR faders; change per-app volume; start and stop apps mid-playback;
   restart coreaudiod and the daemon; check coreaudiod CPU and IO overloads
   stay at today's level.
+
+## Follow-up: app audio management (2026-09-30)
+
+Adds muting, boost to 200 %, per-app level meters, hidden apps, a web UI
+"Apps" page, scroll-wheel sliders, and global hotkeys.
+
+### Driver
+
+- `gxap` gain is per mille from 0 to 2000. Gains above 1000 pass through a
+  soft limiter so boosted apps don't clip. The daemon sends gain 0 for a muted
+  app.
+- A new read-only plug-in property `gxlv` (`0x67786c76`) returns
+  `pid:peak;...`, the peak sample level of each client on a visible playback
+  device since the previous read, after gain, in per mille (clamped to 0-1000).
+  Reading resets the peaks. Clients with no audio since the last read are
+  omitted. The IO path records peaks in fixed atomic slots (claimed by PID
+  with compare-and-swap), so it stays lock- and allocation-free.
+
+### Daemon and IPC
+
+Rules gain `muted` and a volume in percent from 0 to 200:
+
+```rust
+pub struct MacosAppRule { pub route: Option<usize>, pub volume: u16, pub muted: bool }
+```
+
+A rule equal to `{ route: None, volume: 100, muted: false }` is removed.
+Settings also keep a list of hidden app bundle IDs. Existing settings files
+(with `volume` as a `u8` and no `muted`) keep loading.
+
+`DaemonConfig` gains `macos_app_audio`:
+
+```json
+"macos_app_audio": {
+  "apps": [{"bundle_id": "com.spotify.client", "name": "Spotify", "playing": true,
+            "device_route": 0}],
+  "rules": {"com.spotify.client": {"route": 3, "volume": 100, "muted": false}},
+  "names": {"com.spotify.client": "Spotify"},
+  "hidden": ["com.apple.siri"],
+  "routes": 61442
+}
+```
+
+- `apps` lists the apps coreaudiod currently knows. `device_route` is the
+  GoXLR playback route (0-4) the app plays to itself, or `null`.
+- `names` remembers display names for apps that have rules but aren't running.
+- `routes` is the enabled route mask.
+
+New `DaemonCommand` variants:
+- `SetMacOSAppRule(String, Option<usize>, u16, bool)`: bundle ID, route,
+  volume, muted.
+- `RemoveMacOSAppRule(String)`
+- `SetMacOSAppHidden(String, bool)`
+
+`DaemonRequest::GetMacOSAppLevels` answers with
+`DaemonResponse::MacOSAppLevels(HashMap<String, f32>)`, the peak level from 0
+to 1 per bundle ID. The web UI polls it like `GetMicLevel`.
+
+### Tray
+
+- Each app's submenu gains a Mute item.
+- The app volume slider runs from 0 to 200 %.
+- Hidden apps are left out.
+- Every slider responds to the scroll wheel.
+
+### Hotkeys
+
+These are configured in the web UI and registered with Carbon
+`RegisterEventHotKey`, which needs no Accessibility permission:
+- raise, lower, or mute a GoXLR channel;
+- mute or unmute the frontmost app.

@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -12,6 +13,7 @@
 #include <optional>
 #include <string>
 #include <sys/types.h>
+#include <utility>
 #include <vector>
 
 // Per-app routing between the stereo playback routes (System, Game, Chat, Music, Sample).
@@ -21,6 +23,8 @@
 // move into a per-cycle scratch buffer for that route and are zeroed in place. When the source
 // device writes its mix, the scratch buffers are published to injection histories, which the
 // target route's bridge reader sums with its own history.
+//
+// Every client's peak level after gain is recorded per PID, so the daemon can show meters.
 namespace app_routing {
 
 constexpr size_t kRoutes = 5;
@@ -28,6 +32,10 @@ constexpr size_t kMaxRules = 128;
 constexpr uint32_t kMaxFrames = 4096;
 constexpr uint32_t kKeepRoute = 0xFF;
 constexpr uint32_t kUnityGain = 1000;
+constexpr uint32_t kMaxGain = 2000;
+// Boosted samples above this magnitude are softly saturated so they never pass 1.0.
+constexpr float kLimiterKnee = 0.8f;
+constexpr size_t kLevelSlots = 128;
 constexpr size_t kInjectionFrames = 4096;
 // A reader this far behind an injection history (e.g. after it stalled) skips ahead.
 constexpr uint64_t kMaxReaderLag = 1024;
@@ -40,7 +48,7 @@ struct Rule {
 };
 
 // Parses "pid:route:gain;..." where route is 0-4 or '-' to keep the device the app chose, and
-// gain is per mille (0-1000). Returns nothing if any entry is malformed.
+// gain is per mille (0-2000). Returns nothing if any entry is malformed.
 inline std::optional<std::vector<Rule>> parseRules(const std::string& text) {
     std::vector<Rule> rules;
     size_t start = 0;
@@ -72,7 +80,7 @@ inline std::optional<std::vector<Rule>> parseRules(const std::string& text) {
 
         const std::string gainText = entry.substr(second + 1);
         const long gain = std::strtol(gainText.c_str(), &rest, 10);
-        if (gainText.empty() || *rest != '\0' || gain < 0 || gain > long(kUnityGain)) {
+        if (gainText.empty() || *rest != '\0' || gain < 0 || gain > long(kMaxGain)) {
             return std::nullopt;
         }
 
@@ -115,6 +123,94 @@ private:
     std::array<std::atomic<uint64_t>, kMaxRules> slots_{};
 };
 
+// Identity up to the knee, then a tanh curve that approaches 1.0 without reaching past it.
+inline float softLimit(float sample) {
+    const float magnitude = std::fabs(sample);
+    if (!(magnitude > kLimiterKnee)) return sample;
+    const float range = 1.0f - kLimiterKnee;
+    const float limited = kLimiterKnee + range * std::tanh((magnitude - kLimiterKnee) / range);
+    return std::copysign(std::min(limited, 1.0f), sample);
+}
+
+// Scales `samples` in place by a per mille gain. Mute writes exact zeros; boosts are limited.
+inline void applyGain(float* samples, uint32_t count, uint32_t gain) {
+    if (gain == kUnityGain) return;
+    if (gain == 0) {
+        std::fill(samples, samples + count, 0.0f);
+        return;
+    }
+    const float scale = float(gain) / float(kUnityGain);
+    if (gain < kUnityGain) {
+        for (uint32_t i = 0; i < count; ++i) samples[i] *= scale;
+        return;
+    }
+    for (uint32_t i = 0; i < count; ++i) samples[i] = softLimit(samples[i] * scale);
+}
+
+// The largest sample magnitude in per mille, clamped to 0-1000.
+inline uint32_t peakPerMille(const float* samples, uint32_t count) {
+    float peak = 0.0f;
+    for (uint32_t i = 0; i < count; ++i) {
+        const float magnitude = std::fabs(samples[i]);
+        if (magnitude > peak) peak = magnitude;
+    }
+    return uint32_t(std::min(peak, 1.0f) * float(kUnityGain) + 0.5f);
+}
+
+// Peak level per PID since the last take, in fixed slots packing pid << 32 | peak. IO threads
+// claim an empty slot or raise their own with compare-and-swap. A take racing a record may
+// leave one PID in two slots; take() merges them. When every slot is taken, new PIDs are
+// dropped until the next take.
+class LevelTable {
+public:
+    void record(pid_t pid, uint32_t peak) {
+        if (pid <= 0 || peak == 0) return;
+        const uint64_t packed = (uint64_t(uint32_t(pid)) << 32) | peak;
+        for (auto& slot : slots_) {
+            uint64_t current = slot.load(std::memory_order_relaxed);
+            while (true) {
+                if (current == 0) {
+                    if (slot.compare_exchange_weak(current, packed, std::memory_order_acq_rel,
+                                                   std::memory_order_relaxed)) {
+                        return;
+                    }
+                    continue;
+                }
+                if (pid_t(current >> 32) != pid) break;
+                if (uint32_t(current) >= peak) return;
+                if (slot.compare_exchange_weak(current, packed, std::memory_order_acq_rel,
+                                               std::memory_order_relaxed)) {
+                    return;
+                }
+            }
+        }
+    }
+
+    // Returns "pid:peak;..." for every recorded PID and clears the table. Not real-time safe.
+    std::string take() {
+        std::vector<std::pair<pid_t, uint32_t>> peaks;
+        for (auto& slot : slots_) {
+            const uint64_t packed = slot.exchange(0, std::memory_order_acq_rel);
+            if (packed == 0) continue;
+            const pid_t pid = pid_t(packed >> 32);
+            const uint32_t peak = std::min(uint32_t(packed), kUnityGain);
+            auto existing = std::find_if(peaks.begin(), peaks.end(),
+                                         [pid](const auto& entry) { return entry.first == pid; });
+            if (existing == peaks.end()) peaks.emplace_back(pid, peak);
+            else existing->second = std::max(existing->second, peak);
+        }
+        std::string text;
+        for (const auto& [pid, peak] : peaks) {
+            if (peak == 0) continue;
+            text += std::to_string(pid) + ':' + std::to_string(peak) + ';';
+        }
+        return text;
+    }
+
+private:
+    std::array<std::atomic<uint64_t>, kLevelSlots> slots_{};
+};
+
 class Router {
 public:
     struct Cursors {
@@ -133,21 +229,20 @@ public:
 
     // Called on the source route's IO thread for one client's stereo samples, before the mix.
     // `enabledRoutes` has bit n set when playback route n is being bridged to the GoXLR.
+    // Clients without a rule keep their route and gain but still have their level recorded.
     void processClientOutput(size_t source, pid_t pid, float* frames, uint32_t frameCount,
                              double sampleTime, uint32_t enabledRoutes) {
+        if (source >= kRoutes) return;
         uint32_t route = kKeepRoute;
         uint32_t gain = kUnityGain;
-        if (source >= kRoutes || !rules_.lookup(pid, route, gain)) return;
+        rules_.lookup(pid, route, gain);
 
-        const float scale = float(gain) / float(kUnityGain);
+        applyGain(frames, frameCount * 2, gain);
+        levels_.record(pid, peakPerMille(frames, frameCount * 2));
+
         const bool moves = route < kRoutes && route != source && frameCount <= kMaxFrames &&
                            (enabledRoutes & (1u << route)) != 0;
-        if (!moves) {
-            if (gain != kUnityGain) {
-                for (uint32_t i = 0; i < frameCount * 2; ++i) frames[i] *= scale;
-            }
-            return;
-        }
+        if (!moves) return;
 
         Scratch& scratch = scratch_[source][route];
         if (!scratch.used || scratch.sampleTime != sampleTime || scratch.frames != frameCount) {
@@ -157,10 +252,13 @@ public:
             scratch.used = true;
         }
         for (uint32_t i = 0; i < frameCount * 2; ++i) {
-            scratch.samples[i] += frames[i] * scale;
+            scratch.samples[i] += frames[i];
             frames[i] = 0.0f;
         }
     }
+
+    // Peak levels since the previous call as "pid:peak;...". Not real-time safe.
+    std::string takeLevels() { return levels_.take(); }
 
     // Called on the source route's IO thread when it writes its mix for `sampleTime`.
     void flush(size_t source, double sampleTime) {
@@ -212,6 +310,7 @@ private:
     };
 
     RuleTable rules_;
+    LevelTable levels_;
     std::array<std::array<Scratch, kRoutes>, kRoutes> scratch_{};
     std::array<std::array<std::unique_ptr<StereoHistory>, kRoutes>, kRoutes> injections_{};
 };

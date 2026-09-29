@@ -23,6 +23,7 @@ constexpr UInt32 kSampleRate = 48000;
 constexpr size_t kHistoryFrames = 2048;
 constexpr UInt32 kRouteMaskSelector = 0x67787274; // 'gxrt'
 constexpr UInt32 kAppRulesSelector = 0x67786170; // 'gxap'
+constexpr UInt32 kAppLevelsSelector = 0x67786c76; // 'gxlv'
 constexpr UInt32 kRouteMaskAll = (1u << 17) - 1;
 constexpr UInt32 kDefaultRouteMask = 0xF002;
 constexpr size_t kRouteCount = 17;
@@ -60,6 +61,7 @@ public:
                                &RoutePlugin::GetRouteMask, &RoutePlugin::SetRouteMask);
         RegisterCustomProperty(kAppRulesSelector, *this,
                                &RoutePlugin::GetAppRules, &RoutePlugin::SetAppRules);
+        RegisterCustomProperty(kAppLevelsSelector, *this, &RoutePlugin::GetAppLevels);
     }
 
     const std::shared_ptr<app_routing::Router>& router() const { return router_; }
@@ -92,6 +94,13 @@ public:
         }
         router_->setRules(*rules);
         NotifyPropertyChanged(kAppRulesSelector);
+    }
+
+    // Read-only. Each read returns the peaks since the previous read and resets them.
+    CFStringRef GetAppLevels() const {
+        const std::string levels = router_->takeLevels();
+        return CFStringCreateWithCString(kCFAllocatorDefault, levels.c_str(),
+                                         kCFStringEncodingASCII);
     }
 
     CFStringRef GetRouteMask() const {

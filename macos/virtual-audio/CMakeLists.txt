@@ -47,3 +47,7 @@ add_test(NAME GoXLRVirtualRingTest COMMAND GoXLRVirtualRingTest)
 add_executable(GoXLRVirtualRoutingTest tests/AppRouting.cpp)
 target_include_directories(GoXLRVirtualRoutingTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 add_test(NAME GoXLRVirtualRoutingTest COMMAND GoXLRVirtualRoutingTest)
+
+# The tests rely on assert(), keep it active in Release builds too.
+target_compile_options(GoXLRVirtualRingTest PRIVATE -UNDEBUG)
+target_compile_options(GoXLRVirtualRoutingTest PRIVATE -UNDEBUG)
