@@ -43,3 +43,7 @@ enable_testing()
 add_executable(GoXLRVirtualRingTest tests/StereoHistory.cpp)
 target_include_directories(GoXLRVirtualRingTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 add_test(NAME GoXLRVirtualRingTest COMMAND GoXLRVirtualRingTest)
+
+add_executable(GoXLRVirtualRoutingTest tests/AppRouting.cpp)
+target_include_directories(GoXLRVirtualRoutingTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+add_test(NAME GoXLRVirtualRoutingTest COMMAND GoXLRVirtualRoutingTest)
