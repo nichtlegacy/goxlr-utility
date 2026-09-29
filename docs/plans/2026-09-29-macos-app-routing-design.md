@@ -151,3 +151,37 @@ These are configured in the web UI and registered with Carbon
 `RegisterEventHotKey`, which needs no Accessibility permission:
 - raise, lower, or mute a GoXLR channel;
 - mute or unmute the frontmost app.
+
+### Hotkeys contract
+
+`DaemonConfig.macos_hotkeys` is a list of bindings:
+
+```json
+"macos_hotkeys": [
+  {"action": {"VolumeUp": "Chat"}, "code": "ArrowUp",
+   "modifiers": {"command": false, "option": true, "control": true, "shift": false}},
+  {"action": "ToggleFrontmostAppMute", "code": "KeyM",
+   "modifiers": {"command": false, "option": true, "control": true, "shift": false}}
+]
+```
+
+- **Actions:**
+  - `{"VolumeUp": <ChannelName>}` and `{"VolumeDown": <ChannelName>}` change a
+    GoXLR channel's volume by 5 %. The channels are System, Game, Chat, Music,
+    and Sample, using the existing `ChannelName` serialization.
+  - `{"ToggleMute": <ChannelName>}` mutes or unmutes the channel's volume and
+    restores the previous level when unmuting.
+  - `"ToggleFrontmostAppMute"` toggles the muted flag of the frontmost app's
+    per-app rule.
+- **Keys:** `code` is the web `KeyboardEvent.code` value (for example `KeyM`,
+  `Digit1`, `F13`, `ArrowUp`, `Minus`). The daemon maps it to a macOS virtual
+  key code and ignores codes it doesn't know. At least one modifier is
+  required, except for F13–F19.
+- **Setting:** `DaemonCommand::SetMacOSHotkeys(Vec<Binding>)` replaces the
+  list. The daemon persists it and re-registers the hotkeys immediately.
+- **Registration:** Carbon `RegisterEventHotKey` on the main thread, driven by
+  the tray's run loop. A binding that can't be registered (already taken) is
+  logged and skipped.
+- **Web UI:** a "Keyboard shortcuts" section in the System tab, macOS only. It
+  lists the bindings; for each one you pick an action and channel and record
+  a key combination by pressing it. You can remove bindings and add new ones.
