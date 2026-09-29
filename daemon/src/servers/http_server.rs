@@ -6,10 +6,12 @@ use actix_web::middleware::Condition;
 use actix_web::web::Data;
 use actix_web::{App, HttpRequest, HttpResponse, HttpServer, get, post, web};
 use actix_ws::{AggregatedMessage, CloseCode, CloseReason, Session};
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use enum_map::EnumMap;
 use futures_util::StreamExt;
 use include_dir::{Dir, include_dir};
+use json_patch::jsonptr::PointerBuf;
+use json_patch::{Patch, PatchOperation, ReplaceOperation};
 use jsonpath_rust::JsonPath;
 use log::{debug, error, info, warn};
 use mime_guess::MimeGuess;
@@ -17,13 +19,15 @@ use mime_guess::mime::IMAGE_PNG;
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::env;
 use std::fs::File;
 use std::io::Write;
 use std::path::{Component, PathBuf};
-use std::{env, fs};
+use std::sync::Mutex;
 use tokio::sync::broadcast::Sender as BroadcastSender;
+use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::oneshot;
 use tokio::sync::oneshot::Sender;
-use tokio::sync::{RwLock, oneshot};
 
 use crate::PatchEvent;
 use crate::files::{FilePaths, find_file_in_path};
@@ -35,7 +39,7 @@ use goxlr_scribbles::get_scribble_png;
 use goxlr_types::FaderName;
 
 use crate::primary_worker::{DeviceCommand, DeviceSender};
-use crate::servers::server_packet::handle_packet;
+use crate::servers::server_packet::{RESPONSE_TIMEOUT, await_response, handle_packet};
 
 const WEB_CONTENT: Dir = include_dir!("./daemon/web-content/");
 
@@ -44,7 +48,8 @@ struct AppData {
     broadcast_tx: BroadcastSender<PatchEvent>,
     file_paths: FilePaths,
 
-    scribble_state: EnumMap<FaderName, ScribbleState>,
+    // The only mutable state, never held across an await.
+    scribble_state: Mutex<EnumMap<FaderName, ScribbleState>>,
 }
 
 #[derive(Debug, Default)]
@@ -61,12 +66,12 @@ pub async fn spawn_http_server(
     file_paths: FilePaths,
 ) {
     // Create the AppData ONCE, outside the closure
-    let app_data = Data::new(RwLock::new(AppData {
+    let app_data = Data::new(AppData {
         broadcast_tx: broadcast_tx.clone(),
         usb_tx: usb_tx.clone(),
         file_paths: file_paths.clone(),
-        scribble_state: EnumMap::default(),
-    }));
+        scribble_state: Mutex::new(EnumMap::default()),
+    });
 
     let server = HttpServer::new(move || {
         let cors = Cors::default()
@@ -128,26 +133,45 @@ struct WsResponse(WebsocketResponse);
 
 #[get("/api/websocket")]
 async fn websocket(
-    app_data: Data<RwLock<AppData>>,
+    app_data: Data<AppData>,
     req: HttpRequest,
     body: web::Payload,
 ) -> Result<HttpResponse, actix_web::Error> {
     let (response, mut session, msg_stream) = actix_ws::handle(&req, body)?;
 
-    let data = app_data.read().await;
-    let mut usb_tx = data.usb_tx.clone();
-    let mut broadcast_rx = data.broadcast_tx.subscribe();
+    let mut usb_tx = app_data.usb_tx.clone();
+    let mut broadcast_rx = app_data.broadcast_tx.subscribe();
 
     // Spawn the handler (this is now where we do stuff)
     actix_web::rt::spawn(async move {
         let mut msg_stream = msg_stream.aggregate_continuations();
+        let mut broadcast_open = true;
 
         let close_reason = loop {
             tokio::select! {
-                Ok(patch) = broadcast_rx.recv() => {
+                result = broadcast_rx.recv(), if broadcast_open => {
+                    let patch = match result {
+                        Ok(patch) => patch.data,
+                        Err(RecvError::Lagged(skipped)) => {
+                            // We've missed patches, so resync this client with the full status..
+                            warn!("Websocket lagged by {} patches, resending status", skipped);
+                            broadcast_rx = broadcast_rx.resubscribe();
+                            match full_status_patch(usb_tx.clone()).await {
+                                Ok(patch) => patch,
+                                Err(error) => {
+                                    warn!("Unable to resync websocket: {}", error);
+                                    continue;
+                                }
+                            }
+                        }
+                        Err(RecvError::Closed) => {
+                            broadcast_open = false;
+                            continue;
+                        }
+                    };
                     let message = WsResponse(WebsocketResponse {
                         id: u64::MAX,
-                        data: DaemonResponse::Patch(patch.data),
+                        data: DaemonResponse::Patch(patch),
                     });
                     if let Err(e) = send_response(message, &mut session).await {
                         break e;
@@ -310,31 +334,31 @@ async fn send_response(res: WsResponse, session: &mut Session) -> Result<(), Opt
 #[post("/api/command")]
 async fn execute_command(
     request: web::Json<DaemonRequest>,
-    app_data: Data<RwLock<AppData>>,
+    app_data: Data<AppData>,
 ) -> HttpResponse {
-    let mut data = app_data.write().await;
+    let mut usb_tx = app_data.usb_tx.clone();
 
     // Errors propagate weirdly in the javascript world, so send all as OK, and handle there.
-    match handle_packet(request.0, &mut data.usb_tx).await {
+    match handle_packet(request.0, &mut usb_tx).await {
         Ok(result) => HttpResponse::Ok().json(result),
         Err(error) => HttpResponse::Ok().json(DaemonResponse::Error(error.to_string())),
     }
 }
 
 #[get("/api/get-devices")]
-async fn get_devices(app_data: Data<RwLock<AppData>>) -> HttpResponse {
-    if let Ok(response) = get_status(app_data).await {
+async fn get_devices(app_data: Data<AppData>) -> HttpResponse {
+    if let Ok(response) = get_status(app_data.usb_tx.clone()).await {
         return HttpResponse::Ok().json(&response);
     }
     HttpResponse::InternalServerError().finish()
 }
 
 #[get("/api/path")]
-async fn get_path(app_data: Data<RwLock<AppData>>, req: HttpRequest) -> HttpResponse {
+async fn get_path(app_data: Data<AppData>, req: HttpRequest) -> HttpResponse {
     let params = web::Query::<HashMap<String, String>>::from_query(req.query_string());
     if let Ok(params) = params {
         if let Some(path) = params.get("path") {
-            if let Ok(status) = get_status(app_data).await {
+            if let Ok(status) = get_status(app_data.usb_tx.clone()).await {
                 if let Ok(value) = serde_json::to_value(status) {
                     if let Ok(result) = value.query(path) {
                         return HttpResponse::Ok().json(result);
@@ -360,7 +384,7 @@ async fn get_path(app_data: Data<RwLock<AppData>>, req: HttpRequest) -> HttpResp
 #[get("/files/scribble/{serial}/{fader}.png")]
 async fn get_scribble(
     path: web::Path<(String, FaderName)>,
-    app_data: Data<RwLock<AppData>>,
+    app_data: Data<AppData>,
 ) -> HttpResponse {
     let serial = &path.0;
     let fader = path.1;
@@ -368,67 +392,67 @@ async fn get_scribble(
     let final_width = 128;
     let final_height = 64;
 
-    // Now we need to grab the DaemonResponse to get the layout of the scribble
-    let mut data = app_data.write().await;
-    let request = DaemonRequest::GetStatus;
-
-    // Pull out the scribble configuration from the Daemon Status
-    let scribble = handle_packet(request, &mut data.usb_tx)
+    // Now we need to grab the DaemonStatus to get the layout of the scribble
+    let scribble = get_status(app_data.usb_tx.clone())
         .await
         .ok()
-        .and_then(|response| match response {
-            DaemonResponse::Status(status) => status
+        .and_then(|status| {
+            status
                 .mixers
                 .get(serial)
-                .and_then(|mixer| mixer.fader_status[fader].scribble.clone()),
-            _ => None,
+                .and_then(|mixer| mixer.fader_status[fader].scribble.clone())
         });
 
-    if scribble.is_none() {
+    let Some(scribble) = scribble else {
         return HttpResponse::NotFound().finish();
+    };
+
+    {
+        let state = &app_data.scribble_state.lock().unwrap()[fader];
+        if state.scribble_config.as_ref() == Some(&scribble) {
+            // If we already have the PNG data, return it.
+            if let Some(png_data) = &state.png_data {
+                debug!("Returning Cached Scribble Image for {} - {}", serial, fader);
+                let mime_type = ContentType(IMAGE_PNG);
+                let mut builder = HttpResponse::Ok();
+                builder.insert_header(mime_type);
+                return builder.body(png_data.clone());
+            }
+        }
     }
 
-    let state = &data.scribble_state[fader];
-    if state.scribble_config == scribble && state.png_data.is_some() {
-        // If we already have the PNG data, return it.
-        if let Some(png_data) = &data.scribble_state[fader].png_data {
-            debug!("Returning Cached Scribble Image for {} - {}", serial, fader);
-            let mime_type = ContentType(IMAGE_PNG);
-            let mut builder = HttpResponse::Ok();
-            builder.insert_header(mime_type);
-            return builder.body(png_data.clone());
-        }
-    } else if let Some(scribble) = scribble {
-        debug!("Building Scribble Image for {} - {}", serial, fader);
-        let scribble_path = data.file_paths.icons.clone();
+    debug!("Building Scribble Image for {} - {}", serial, fader);
+    let icon_path = scribble
+        .file_name
+        .as_ref()
+        .map(|file| app_data.file_paths.icons.join(file));
 
-        let mut icon_path = None;
-        if let Some(file) = &scribble.file_name {
-            icon_path = Some(scribble_path.join(file));
-        }
-
-        let png = get_scribble_png(
+    // Rendering loads the icon from disk, so keep it off the server's worker.
+    let render = scribble.clone();
+    let png = web::block(move || {
+        get_scribble_png(
             icon_path,
-            scribble.bottom_text.clone(),
-            scribble.left_text.clone(),
-            scribble.inverted,
+            render.bottom_text,
+            render.left_text,
+            render.inverted,
             final_width,
             final_height,
-        );
+        )
+    })
+    .await;
 
-        if let Ok(png) = png {
-            data.scribble_state[fader] = ScribbleState {
-                scribble_config: Some(scribble.clone()),
-                png_data: Some(png.clone()),
-            };
+    if let Ok(Ok(png)) = png {
+        app_data.scribble_state.lock().unwrap()[fader] = ScribbleState {
+            scribble_config: Some(scribble),
+            png_data: Some(png.clone()),
+        };
 
-            debug!("Creating Image {}x{}", final_width, final_height);
+        debug!("Creating Image {}x{}", final_width, final_height);
 
-            let mime_type = ContentType(IMAGE_PNG);
-            let mut builder = HttpResponse::Ok();
-            builder.insert_header(mime_type);
-            return builder.body(png);
-        }
+        let mime_type = ContentType(IMAGE_PNG);
+        let mut builder = HttpResponse::Ok();
+        builder.insert_header(mime_type);
+        return builder.body(png);
     }
 
     debug!("Unable to Build Image: {} - {}", serial, fader);
@@ -436,12 +460,9 @@ async fn get_scribble(
 }
 
 #[get("/files/samples/{sample}")]
-async fn get_sample(sample: web::Path<String>, app_data: Data<RwLock<AppData>>) -> HttpResponse {
+async fn get_sample(sample: web::Path<String>, app_data: Data<AppData>) -> HttpResponse {
     // Get the Base Samples Path..
-    let sample_path = {
-        let data = app_data.read().await;
-        data.file_paths.samples.clone()
-    };
+    let sample_path = app_data.file_paths.samples.clone();
 
     let sample = sample.into_inner();
     let path = PathBuf::from(sample);
@@ -456,9 +477,17 @@ async fn get_sample(sample: web::Path<String>, app_data: Data<RwLock<AppData>>) 
     if let Some(path) = file {
         debug!("Found at {:?}", path);
         let mime_type = MimeGuess::from_path(path.clone()).first_or_octet_stream();
-        let mut builder = HttpResponse::Ok();
-        builder.insert_header(ContentType(mime_type));
-        return builder.body(fs::read(path).unwrap());
+        return match tokio::fs::read(&path).await {
+            Ok(content) => {
+                let mut builder = HttpResponse::Ok();
+                builder.insert_header(ContentType(mime_type));
+                builder.body(content)
+            }
+            Err(error) => {
+                warn!("Unable to Read Sample {:?}: {}", path, error);
+                HttpResponse::InternalServerError().finish()
+            }
+        };
     }
 
     HttpResponse::NotFound().finish()
@@ -468,7 +497,7 @@ async fn get_sample(sample: web::Path<String>, app_data: Data<RwLock<AppData>>) 
 async fn upload_firmware(
     path: web::Path<String>,
     mut payload: Multipart,
-    app_data: Data<RwLock<AppData>>,
+    app_data: Data<AppData>,
 ) -> HttpResponse {
     let serial = path.into_inner();
     let file_path = env::temp_dir().join(format!("{serial}.bin"));
@@ -505,10 +534,9 @@ async fn upload_firmware(
     }
 
     // When we get here, the file has been uploaded successfully...
-    let data = app_data.read().await;
     let (tx, rx) = oneshot::channel();
 
-    let _ = data
+    let _ = app_data
         .usb_tx
         .send(DeviceCommand::RunFirmwareUpdate(
             serial,
@@ -517,7 +545,7 @@ async fn upload_firmware(
             tx,
         ))
         .await;
-    let result = rx.await;
+    let result = await_response(rx, RESPONSE_TIMEOUT).await;
     match result {
         Ok(_) => HttpResponse::Ok().body(serde_json::to_string(&DaemonResponse::Ok).unwrap()),
         Err(e) => HttpResponse::InternalServerError().body(format!("Error Occurred: {e}")),
@@ -542,13 +570,30 @@ async fn default(req: HttpRequest) -> HttpResponse {
     }
 }
 
-async fn get_status(app_data: Data<RwLock<AppData>>) -> Result<DaemonStatus> {
-    let mut data = app_data.write().await;
+async fn get_status(mut usb_tx: DeviceSender) -> Result<DaemonStatus> {
     let request = DaemonRequest::GetStatus;
 
-    let result = handle_packet(request, &mut data.usb_tx).await?;
+    let result = handle_packet(request, &mut usb_tx).await?;
     match result {
         DaemonResponse::Status(status) => Ok(status),
         _ => Err(anyhow!("Unexpected Daemon Status Result: {:?}", result)),
     }
+}
+
+/// Builds a patch replacing every top level field of the status, to resync a lagged client
+async fn full_status_patch(usb_tx: DeviceSender) -> Result<Patch> {
+    let Value::Object(fields) = serde_json::to_value(get_status(usb_tx).await?)? else {
+        bail!("DaemonStatus did not serialise to an Object");
+    };
+    Ok(Patch(
+        fields
+            .into_iter()
+            .map(|(key, value)| {
+                PatchOperation::Replace(ReplaceOperation {
+                    path: PointerBuf::from_tokens([key.as_str()]),
+                    value,
+                })
+            })
+            .collect(),
+    ))
 }

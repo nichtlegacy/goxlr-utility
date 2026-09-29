@@ -163,16 +163,22 @@ pub async fn spawn_event_handler(
                         #[cfg(unix)]
                         {
                             use shell_words;
+                            use std::os::unix::process::CommandExt;
                             match activate {
                                 Some(exec) => {
                                     let exec = exec.replace("%URL%", &url);
-                                    if let Ok(params) = shell_words::split(&exec) {
+                                    if let Ok(params) = shell_words::split(&exec)
+                                        && !params.is_empty()
+                                    {
                                         debug!("Attempting to Execute: {:?}", params);
+                                        // Run the UI in its own process group, otherwise launchd kills
+                                        // it along with the daemon's job whenever the daemon restarts.
                                         let result = Command::new(&params[0])
                                             .current_dir(tmp_dir)
                                             .args(&params[1..])
                                             .stdout(Stdio::null())
                                             .stderr(Stdio::null())
+                                            .process_group(0)
                                             .spawn();
 
                                         if let Err(error) = result {
@@ -182,8 +188,11 @@ pub async fn spawn_event_handler(
                                             }
                                         }
 
-                                    } else if let Err(error) = open::that(url) {
-                                        warn!("Error Opening URL: {:?}", error);
+                                    } else {
+                                        warn!("Invalid Activation Command {:?}, falling back", exec);
+                                        if let Err(error) = open::that(url) {
+                                            warn!("Error Opening URL: {:?}", error);
+                                        }
                                     }
                                 },
                                 None => {

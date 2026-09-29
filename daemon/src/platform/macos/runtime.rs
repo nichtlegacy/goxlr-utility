@@ -18,6 +18,7 @@ use crate::settings::SettingsHandle;
 use crate::shutdown::Shutdown;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
+use tokio::task;
 use tokio::time::sleep;
 use tokio::{select, time};
 
@@ -33,22 +34,27 @@ pub async fn run(
     mut stop: Shutdown,
 ) -> Result<()> {
     let bridge_stop = stop.clone();
-    tokio::spawn(async move {
+    let bridge = tokio::spawn(async move {
         if let Err(error) = audio_bridge::run(settings, bridge_stop).await {
             warn!("GoXLR virtual audio bridge stopped: {error}");
         }
     });
 
     // Before we start, we should destroy any existing aggregate devices as they're unmanaged.
-    if let Ok(devices) = find_all_existing_aggregates() {
-        for device in devices {
-            if destroy_aggregate_device(device).is_err() {
-                warn!("Unable to Destroy Aggregate Device {}", device);
+    // CoreAudio calls can block while coreaudiod is busy, so keep them off the tokio workers.
+    let _ = task::spawn_blocking(|| {
+        if let Ok(devices) = find_all_existing_aggregates() {
+            for device in devices {
+                if destroy_aggregate_device(device).is_err() {
+                    warn!("Unable to Destroy Aggregate Device {}", device);
+                }
             }
         }
-    }
+    })
+    .await;
 
     if !HANDLE_MACOS_AGGREGATES.lock().unwrap().unwrap() {
+        let _ = bridge.await;
         return Ok(());
     }
 
@@ -60,41 +66,14 @@ pub async fn run(
 
     // A list of devices, and a list of their associated AudioDeviceIDs..
     let mut device_map: HashMap<String, Vec<AudioDeviceID>> = HashMap::new();
-    let mut remove_keys: Vec<String> = vec![];
 
     loop {
         select! {
             _ = ticker.tick() => {
-                if let Ok(devices) = get_goxlr_devices() {
-                    // Iterate the device map to check for things..
-                    for uid in device_map.keys() {
-                        // Is this device still present?
-                        if !devices.iter().any(|d| d.uid == *uid) {
-                            debug!("{} No longer Present in Map..", uid);
-                            if destroy_devices(device_map.get(uid).unwrap()).is_err() {
-                                warn!("Error Removing Aggregate Devices");
-                            }
-                            remove_keys.push(uid.clone());
-                        }
-                    }
-
-                    // Remove the devices from the map..
-                    device_map.retain(|uid, _| { !remove_keys.contains(uid) });
-
-                    // Reset the Key Removal
-                    remove_keys = vec![];
-
-                    for device in devices {
-                        if let Vacant(entry) = device_map.entry(device.uid.clone()) {
-                            debug!("Creating Aggregates for {}", device.uid.clone());
-                            match create_devices(device) {
-                                Ok(devices) => { entry.insert(devices); },
-                                Err(error) => {
-                                    error!("Unable to Create Device: {}", error)
-                                }
-                            }
-                        }
-                    }
+                let map = std::mem::take(&mut device_map);
+                match task::spawn_blocking(move || refresh_devices(map)).await {
+                    Ok(map) => device_map = map,
+                    Err(error) => error!("Aggregate Device Refresh Failed: {}", error),
                 }
             },
 
@@ -108,15 +87,20 @@ pub async fn run(
                 debug!("Destroying Aggregates and Stopping..");
 
                 // Destroy existing devices..
-                for devices in device_map.values() {
-                    if let Err(error) = destroy_devices(devices) {
-                        error!("Error Removing Device: {}", error);
+                let map = std::mem::take(&mut device_map);
+                let _ = task::spawn_blocking(move || {
+                    for devices in map.values() {
+                        if let Err(error) = destroy_devices(devices) {
+                            error!("Error Removing Device: {}", error);
+                        }
                     }
-                }
+                })
+                .await;
 
                 // Wait a second so CoreAudio can clean up..
                 sleep(Duration::from_secs(1)).await;
 
+                let _ = bridge.await;
                 debug!("Runtime Ended");
                 break;
             }
@@ -124,6 +108,44 @@ pub async fn run(
     }
 
     Ok(())
+}
+
+fn refresh_devices(
+    mut device_map: HashMap<String, Vec<AudioDeviceID>>,
+) -> HashMap<String, Vec<AudioDeviceID>> {
+    if let Ok(devices) = get_goxlr_devices() {
+        let mut remove_keys: Vec<String> = vec![];
+
+        // Iterate the device map to check for things..
+        for uid in device_map.keys() {
+            // Is this device still present?
+            if !devices.iter().any(|d| d.uid == *uid) {
+                debug!("{} No longer Present in Map..", uid);
+                if destroy_devices(device_map.get(uid).unwrap()).is_err() {
+                    warn!("Error Removing Aggregate Devices");
+                }
+                remove_keys.push(uid.clone());
+            }
+        }
+
+        // Remove the devices from the map..
+        device_map.retain(|uid, _| !remove_keys.contains(uid));
+
+        for device in devices {
+            if let Vacant(entry) = device_map.entry(device.uid.clone()) {
+                debug!("Creating Aggregates for {}", device.uid.clone());
+                match create_devices(device) {
+                    Ok(devices) => {
+                        entry.insert(devices);
+                    }
+                    Err(error) => {
+                        error!("Unable to Create Device: {}", error)
+                    }
+                }
+            }
+        }
+    }
+    device_map
 }
 
 fn create_devices(device: CoreAudioDevice) -> Result<Vec<AudioDeviceID>> {

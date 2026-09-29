@@ -7,8 +7,12 @@ use coreaudio_sys::{AudioDeviceID, kAudioUnitProperty_StreamFormat};
 use goxlr_usb::PID_GOXLR_FULL;
 use log::{debug, info, warn};
 use rtrb::{Consumer, RingBuffer};
-use std::time::Duration;
-use tokio::time::{self, Instant};
+use std::sync::mpsc::{self as std_mpsc, RecvTimeoutError};
+use std::thread;
+use std::time::{Duration, Instant};
+use tokio::runtime::Handle;
+use tokio::sync::oneshot;
+use tokio::time;
 
 use crate::platform::macos::core_audio::{
     get_device_id_for_uid, get_goxlr_devices, set_virtual_audio_routes,
@@ -22,6 +26,8 @@ const OUTPUT_CHANNELS: usize = 10;
 const CAPTURE_COUNT: usize = 12;
 const PLAYBACK_COUNT: usize = 5;
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(60);
+const TICK: Duration = Duration::from_secs(2);
+const REAPPLY_ROUTES: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy)]
 struct CaptureRoute {
@@ -398,109 +404,155 @@ fn report_error(last_error: &mut Option<String>, message: String) {
 }
 
 pub async fn run(settings: SettingsHandle, mut stop: Shutdown) -> Result<()> {
+    // CoreAudio HAL calls can block for seconds while coreaudiod is busy, so the bridge
+    // lives on its own thread rather than stalling a tokio worker.
+    let handle = Handle::current();
+    let (stop_tx, stop_rx) = std_mpsc::channel::<()>();
+    let (done_tx, done_rx) = oneshot::channel();
+    thread::Builder::new()
+        .name("goxlr-audio-bridge".into())
+        .spawn(move || {
+            bridge_loop(&handle, &settings, &stop_rx);
+            let _ = done_tx.send(());
+        })?;
+
+    stop.recv().await;
+    let _ = stop_tx.send(());
+
+    // Wait (bounded, in case the HAL is wedged) for the thread to stop the AudioUnits.
+    if time::timeout(Duration::from_secs(5), done_rx)
+        .await
+        .is_err()
+    {
+        warn!("GoXLR virtual audio bridge did not stop within 5s");
+    }
+    Ok(())
+}
+
+fn bridge_loop(handle: &Handle, settings: &SettingsHandle, stop: &std_mpsc::Receiver<()>) {
     let mut ids: Option<VirtualIds> = None;
     let mut active: Option<Bridge> = None;
     let mut last_error: Option<String> = None;
+    // Only push the route mask to the plug-in when it changes, or when the plug-in has
+    // been (re)found or errored, rather than on every tick. A restarted coreaudiod can hand
+    // out the same object ids with the plug-in back at its default mask, so also re-apply
+    // it every REAPPLY_ROUTES.
+    let mut applied_routes: Option<u32> = None;
+    let mut routes_applied_at = Instant::now();
     // Each start attempt creates and starts up to 19 AudioUnits, so back off while the
     // physical device keeps refusing to start (e.g. right after it was plugged back in).
     let mut failures = 0u32;
     let mut retry_at: Option<Instant> = None;
-    let mut ticker = time::interval(Duration::from_secs(2));
-    loop {
-        tokio::select! {
-            _ = stop.recv() => break,
-            _ = ticker.tick() => {
-                let current_ids = match virtual_ids() {
-                    Ok(ids) => ids,
-                    Err(error) => {
-                        active = None;
-                        report_error(&mut last_error, error.to_string());
-                        continue;
-                    }
-                };
-                if current_ids != ids {
-                    active = None;
-                    ids = current_ids;
-                }
-                let Some(ids) = ids else {
-                    continue;
-                };
-                let routes = settings.get_macos_virtual_audio_routes().await;
-                if let Err(error) = set_virtual_audio_routes(routes) {
-                    active = None;
-                    report_error(&mut last_error, error.to_string());
-                    continue;
-                }
-                if active.as_ref().is_some_and(|bridge| bridge.routes != routes) {
-                    active = None;
-                }
-                if routes == 0 {
-                    active = None;
-                    continue;
-                }
+    let mut next_tick = Instant::now();
+    // Tick every 2 seconds until a stop is sent (or the sender goes away).
+    while let Err(RecvTimeoutError::Timeout) =
+        stop.recv_timeout(next_tick.saturating_duration_since(Instant::now()))
+    {
+        next_tick = Instant::now() + TICK;
 
-                let devices = match get_goxlr_devices() {
-                    Ok(devices) => devices,
-                    Err(error) => {
-                        active = None;
-                        report_error(&mut last_error, error.to_string());
-                        continue;
-                    }
-                };
-                let full_devices: Vec<_> = devices
-                    .into_iter()
-                    .filter(|device| device.product_id == PID_GOXLR_FULL)
-                    .collect();
-                if full_devices.len() != 1 {
-                    active = None;
+        let current_ids = match virtual_ids() {
+            Ok(ids) => ids,
+            Err(error) => {
+                active = None;
+                applied_routes = None;
+                report_error(&mut last_error, error.to_string());
+                continue;
+            }
+        };
+        if current_ids != ids {
+            active = None;
+            applied_routes = None;
+            ids = current_ids;
+        }
+        let Some(ids) = ids else {
+            continue;
+        };
+        let routes = handle.block_on(settings.get_macos_virtual_audio_routes());
+        if applied_routes != Some(routes) || routes_applied_at.elapsed() >= REAPPLY_ROUTES {
+            if let Err(error) = set_virtual_audio_routes(routes) {
+                active = None;
+                applied_routes = None;
+                report_error(&mut last_error, error.to_string());
+                continue;
+            }
+            applied_routes = Some(routes);
+            routes_applied_at = Instant::now();
+        }
+        if active
+            .as_ref()
+            .is_some_and(|bridge| bridge.routes != routes)
+        {
+            active = None;
+        }
+        if routes == 0 {
+            active = None;
+            continue;
+        }
+
+        let devices = match get_goxlr_devices() {
+            Ok(devices) => devices,
+            Err(error) => {
+                active = None;
+                report_error(&mut last_error, error.to_string());
+                continue;
+            }
+        };
+        let full_devices: Vec<_> = devices
+            .into_iter()
+            .filter(|device| device.product_id == PID_GOXLR_FULL)
+            .collect();
+        if full_devices.len() != 1 {
+            active = None;
+            failures = 0;
+            retry_at = None;
+            if full_devices.len() > 1 {
+                report_error(&mut last_error, "multiple GoXLR Full devices found".into());
+            }
+            continue;
+        }
+        let physical_uid = &full_devices[0].uid;
+        let physical_id = match get_device_id_for_uid(physical_uid) {
+            Ok(id) => id,
+            Err(error) => {
+                active = None;
+                report_error(&mut last_error, error.to_string());
+                continue;
+            }
+        };
+        if active.as_ref().is_some_and(|bridge| {
+            bridge.physical_uid != *physical_uid || Some(bridge.physical_id) != physical_id
+        }) {
+            active = None;
+        }
+        if active.is_none() {
+            let Some(physical_id) = physical_id else {
+                continue;
+            };
+            if retry_at.is_some_and(|at| Instant::now() < at) {
+                continue;
+            }
+            match Bridge::start(physical_uid.clone(), physical_id, ids, routes) {
+                Ok(bridge) => {
+                    info!("GoXLR virtual audio bridge started");
+                    active = Some(bridge);
+                    last_error = None;
                     failures = 0;
                     retry_at = None;
-                    if full_devices.len() > 1 {
-                        report_error(&mut last_error, "multiple GoXLR Full devices found".into());
-                    }
-                    continue;
                 }
-                let physical_uid = &full_devices[0].uid;
-                let physical_id = match get_device_id_for_uid(physical_uid) {
-                    Ok(id) => id,
-                    Err(error) => {
-                        active = None;
-                        report_error(&mut last_error, error.to_string());
-                        continue;
-                    }
-                };
-                if active.as_ref().is_some_and(|bridge| bridge.physical_uid != *physical_uid || Some(bridge.physical_id) != physical_id) {
-                    active = None;
-                }
-                if active.is_none() {
-                    let Some(physical_id) = physical_id else {
-                        continue;
-                    };
-                    if retry_at.is_some_and(|at| Instant::now() < at) {
-                        continue;
-                    }
-                    match Bridge::start(physical_uid.clone(), physical_id, ids, routes) {
-                        Ok(bridge) => {
-                            info!("GoXLR virtual audio bridge started");
-                            active = Some(bridge);
-                            last_error = None;
-                            failures = 0;
-                            retry_at = None;
-                        }
-                        Err(error) => {
-                            report_error(&mut last_error, error.to_string());
-                            failures += 1;
-                            let delay = MAX_RETRY_DELAY.min(Duration::from_secs(2 << failures.min(5)));
-                            debug!("Retrying GoXLR virtual audio bridge in {}s", delay.as_secs());
-                            retry_at = Some(Instant::now() + delay);
-                        }
-                    }
+                Err(error) => {
+                    report_error(&mut last_error, error.to_string());
+                    failures += 1;
+                    let delay = MAX_RETRY_DELAY.min(Duration::from_secs(2 << failures.min(5)));
+                    debug!(
+                        "Retrying GoXLR virtual audio bridge in {}s",
+                        delay.as_secs()
+                    );
+                    retry_at = Some(Instant::now() + delay);
                 }
             }
         }
     }
     drop(active);
-    Ok(())
 }
 
 #[cfg(test)]

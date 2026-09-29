@@ -1,7 +1,23 @@
 use crate::primary_worker::{DeviceCommand, DeviceSender};
 use anyhow::{Context, Result, anyhow};
 use goxlr_ipc::{DaemonRequest, DaemonResponse};
+use std::time::Duration;
 use tokio::sync::oneshot;
+use tokio::time::timeout;
+
+// Upper bound for waiting on the primary worker, so a stalled worker produces an error
+// response instead of hanging the client forever.
+pub const RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
+
+// Device commands can apply a whole profile over USB, so give them longer.
+const DEVICE_COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
+
+pub async fn await_response<T>(rx: oneshot::Receiver<T>, wait: Duration) -> Result<T> {
+    timeout(wait, rx)
+        .await
+        .map_err(|_| anyhow!("Timed out waiting for the device task"))?
+        .map_err(|e| anyhow!(e.to_string()))
+}
 
 pub async fn handle_packet(
     request: DaemonRequest,
@@ -16,9 +32,11 @@ pub async fn handle_packet(
                 .await
                 .map_err(|e| anyhow!(e.to_string()))
                 .context("Could not communicate with the device task")?;
-            Ok(DaemonResponse::Status(rx.await.context(
-                "Could not execute the command on the device task",
-            )?))
+            Ok(DaemonResponse::Status(
+                await_response(rx, RESPONSE_TIMEOUT)
+                    .await
+                    .context("Could not execute the command on the device task")?,
+            ))
         }
         DaemonRequest::Daemon(command) => {
             let (tx, rx) = oneshot::channel();
@@ -27,7 +45,8 @@ pub async fn handle_packet(
                 .await
                 .map_err(|e| anyhow!(e.to_string()))
                 .context("Could not communicate with the GoXLR device")?;
-            rx.await
+            await_response(rx, RESPONSE_TIMEOUT)
+                .await
                 .context("Could not execute the command on the GoXLR device")??;
             Ok(DaemonResponse::Ok)
         }
@@ -39,7 +58,7 @@ pub async fn handle_packet(
                 .map_err(|e| anyhow!(e.to_string()))
                 .map_err(|e| anyhow!(e.to_string()))
                 .context("Could not communicate with the GoXLR device")?;
-            let result = rx
+            let result = await_response(rx, RESPONSE_TIMEOUT)
                 .await
                 .context("Could not execute the command on the GoXLR device")?;
 
@@ -56,7 +75,8 @@ pub async fn handle_packet(
                 .await
                 .map_err(|e| anyhow!(e.to_string()))
                 .context("Could not communicate with the GoXLR device")?;
-            rx.await
+            await_response(rx, DEVICE_COMMAND_TIMEOUT)
+                .await
                 .context("Could not execute the command on the GoXLR device")??;
             Ok(DaemonResponse::Ok)
         }
@@ -67,7 +87,8 @@ pub async fn handle_packet(
                 .send(DeviceCommand::RunFirmwareUpdate(serial, path, force, tx))
                 .await
                 .map_err(anyhow::Error::msg)?;
-            rx.await
+            await_response(rx, RESPONSE_TIMEOUT)
+                .await
                 .context("Could not execute the command on the GoXLR device")??;
             Ok(DaemonResponse::Ok)
         }
@@ -79,7 +100,8 @@ pub async fn handle_packet(
                 .await
                 .map_err(|e| anyhow!(e.to_string()))
                 .context("Could not communicate with the GoXLR device")?;
-            rx.await
+            await_response(rx, RESPONSE_TIMEOUT)
+                .await
                 .context("Could not execute the command on the GoXLR device")??;
             Ok(DaemonResponse::Ok)
         }
@@ -90,7 +112,8 @@ pub async fn handle_packet(
                 .send(DeviceCommand::ClearFirmwareState(serial, tx))
                 .await
                 .map_err(anyhow::Error::msg)?;
-            rx.await
+            await_response(rx, RESPONSE_TIMEOUT)
+                .await
                 .context("Could not execute the command on the GoXLR device")??;
             Ok(DaemonResponse::Ok)
         }

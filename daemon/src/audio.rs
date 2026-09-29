@@ -218,6 +218,7 @@ impl AudioHandler {
         {
             return;
         }
+        self.last_device_check = Some(Instant::now());
 
         let device_list = match is_output {
             true => goxlr_audio::get_audio_outputs(),

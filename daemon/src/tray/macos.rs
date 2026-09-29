@@ -390,14 +390,16 @@ define_class! {
                 // This is pretty similar to Windows, we loop until we're ready to die..
                 let _ = self.ivars().global_tx.try_send(EventTriggers::Stop(false));
 
-                // Now wait for the daemon to actually stop..
-                loop {
-                    if self.ivars().shutdown_signal.load(Ordering::Relaxed) {
+                // Now wait (for up to 5 seconds) for the daemon to actually stop..
+                let mut count = 0;
+                while !self.ivars().shutdown_signal.load(Ordering::Relaxed) {
+                    if count >= 50 {
+                        warn!("Daemon did not stop in time, continuing shutdown");
                         break;
-                    } else {
-                        debug!("Waiting..");
-                        sleep(Duration::from_millis(100));
                     }
+                    debug!("Waiting..");
+                    sleep(Duration::from_millis(100));
+                    count += 1;
                 }
         }
 
