@@ -39,12 +39,17 @@ remain as a fallback.
 - Switches in **System → Utility Settings** to show or hide optional routes immediately. The
   settings panel is scrollable and has English and German labels. Only enabled routes run bridge
   audio units. The selection is saved and restored when the daemon starts.
+- A menubar menu with sliders for the GoXLR System, Game, Chat, and Music channels, and a list of
+  the apps playing to a GoXLR output. Each app can be moved to another GoXLR output and given its
+  own volume; the choice is saved per app. The routing happens inside the driver, so it needs no
+  process taps or audio capture permission. It applies to apps that play to a GoXLR device, such
+  as the system default output.
 
 The default devices are **GoXLR Microphone** (input) and **GoXLR System**, **Game**, **Chat**, and
 **Music** (outputs). The GoXLR Full's remaining capture routes and Sample output can be enabled in
 the Utility; Dry Mic is the only mono route. See the [complete channel map](docs/plans/2026-09-23-macos-full-audio-design.md#device-layout)
-for the physical channel assignments. This does not add a per-app output selector for apps that lack
-one; those apps use the macOS default output unless another routing tool is used.
+for the physical channel assignments. Apps without their own output selector play to the macOS
+default output; the menubar can move them to another GoXLR output.
 
 This implementation was built and tested locally with a GoXLR Full on macOS 27. macOS 26 motivated
 the work but has not been validated with this driver. The upstream release badges and downloads
