@@ -12,8 +12,8 @@ use crate::{
 use anyhow::{Result, anyhow};
 use enum_map::EnumMap;
 use goxlr_ipc::{
-    Activation, ColourWay, DaemonCommand, DaemonConfig, DaemonStatus, DriverDetails, Files,
-    FirmwareSource, FirmwareStatus, GoXLRCommand, HardwareStatus, HttpSettings, Locale,
+    Activation, Binding, ColourWay, DaemonCommand, DaemonConfig, DaemonStatus, DriverDetails,
+    Files, FirmwareSource, FirmwareStatus, GoXLRCommand, HardwareStatus, HttpSettings, Locale,
     MacosAppAudio, MacosAppRule, PathTypes, Paths, SampleFile, UpdateState, UsbProductInformation,
 };
 use goxlr_types::{DeviceType, FirmwareDetails, VersionNumber};
@@ -546,6 +546,14 @@ pub async fn spawn_usb_handler(
                                 change_found = true;
                                 let _ = sender.send(Ok(()));
                             }
+                            DaemonCommand::SetMacOSHotkeys(bindings) => {
+                                settings.set_macos_hotkeys(bindings.clone()).await;
+                                settings.save().await;
+                                hotkeys_changed(bindings);
+
+                                change_found = true;
+                                let _ = sender.send(Ok(()));
+                            }
                         }
                     },
 
@@ -750,6 +758,11 @@ async fn get_daemon_status(
             handle_macos_aggregates: settings.get_macos_handle_aggregates().await,
             macos_virtual_audio_routes: settings.get_macos_virtual_audio_routes().await,
             macos_app_audio: get_app_audio_status(app_audio, settings).await,
+            macos_hotkeys: if cfg!(target_os = "macos") {
+                settings.get_macos_hotkeys().await
+            } else {
+                Vec::new()
+            },
         },
         paths: Paths {
             profile_directory: settings.get_profile_directory().await,
@@ -824,6 +837,15 @@ fn hidden_apps_changed(app_audio: &AppAudio, hidden: Vec<String>) {
 
     #[cfg(not(target_os = "macos"))]
     let _ = (app_audio, hidden);
+}
+
+// Has the macOS main thread register the new hotkeys, other platforms only store them.
+fn hotkeys_changed(bindings: Vec<Binding>) {
+    #[cfg(target_os = "macos")]
+    crate::platform::macos::hotkeys::register_hotkeys(bindings);
+
+    #[cfg(not(target_os = "macos"))]
+    let _ = bindings;
 }
 
 fn send_app_levels(app_audio: &AppAudio, sender: oneshot::Sender<Result<HashMap<String, f32>>>) {

@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use directories::ProjectDirs;
 pub use goxlr_ipc::MacosAppRule;
 use goxlr_ipc::{
-    FirmwareSource, GoXLRCommand, LogLevel, MACOS_ALL_VIRTUAL_AUDIO_ROUTES,
+    Binding, FirmwareSource, GoXLRCommand, LogLevel, MACOS_ALL_VIRTUAL_AUDIO_ROUTES,
     MACOS_DEFAULT_VIRTUAL_AUDIO_ROUTES,
 };
 use goxlr_types::VodMode;
@@ -70,6 +70,7 @@ impl SettingsHandle {
                 macos_app_rules: None,
                 macos_app_names: None,
                 macos_hidden_apps: None,
+                macos_hotkeys: Vec::new(),
                 profile_directory: None,
                 mic_profile_directory: None,
                 samples_directory: None,
@@ -322,6 +323,16 @@ impl SettingsHandle {
             list.push(bundle_id);
             list.sort();
         }
+    }
+
+    pub async fn get_macos_hotkeys(&self) -> Vec<Binding> {
+        let settings = self.settings.read().await;
+        settings.macos_hotkeys.clone()
+    }
+
+    pub async fn set_macos_hotkeys(&self, bindings: Vec<Binding>) {
+        let mut settings = self.settings.write().await;
+        settings.macos_hotkeys = bindings;
     }
 
     pub async fn get_profile_directory(&self) -> PathBuf {
@@ -788,6 +799,8 @@ pub struct Settings {
     macos_app_rules: Option<HashMap<String, MacosAppRule>>,
     macos_app_names: Option<HashMap<String, String>>,
     macos_hidden_apps: Option<Vec<String>>,
+    #[serde(default)]
+    macos_hotkeys: Vec<Binding>,
     profile_directory: Option<PathBuf>,
     mic_profile_directory: Option<PathBuf>,
     samples_directory: Option<PathBuf>,
@@ -968,6 +981,8 @@ impl Default for DeviceSettings {
 #[cfg(test)]
 mod tests {
     use super::{MacosAppRule, Settings, apply_app_rule, remember_app_names};
+    use goxlr_ipc::{Binding, HotkeyAction, HotkeyModifiers};
+    use goxlr_types::ChannelName;
     use std::collections::HashMap;
 
     fn rule(route: Option<usize>, volume: u16, muted: bool) -> MacosAppRule {
@@ -1057,5 +1072,56 @@ mod tests {
             HashMap::from([("com.spotify.client".to_string(), "Spotify".to_string())])
         );
         assert!(!remember_app_names(&rules, &mut names, apps));
+    }
+
+    #[test]
+    fn hotkeys_match_the_contract() {
+        // The example from the hotkeys contract in the design doc.
+        let json = r#"[
+            {"action": {"VolumeUp": "Chat"}, "code": "ArrowUp",
+             "modifiers": {"command": false, "option": true, "control": true, "shift": false}},
+            {"action": "ToggleFrontmostAppMute", "code": "KeyM",
+             "modifiers": {"command": false, "option": true, "control": true, "shift": false}}
+        ]"#;
+        let modifiers = HotkeyModifiers {
+            command: false,
+            option: true,
+            control: true,
+            shift: false,
+        };
+        let expected = vec![
+            Binding {
+                action: HotkeyAction::VolumeUp(ChannelName::Chat),
+                code: "ArrowUp".into(),
+                modifiers,
+            },
+            Binding {
+                action: HotkeyAction::ToggleFrontmostAppMute,
+                code: "KeyM".into(),
+                modifiers,
+            },
+        ];
+        let bindings: Vec<Binding> = serde_json::from_str(json).unwrap();
+        assert_eq!(bindings, expected);
+
+        let value = serde_json::to_value(&bindings).unwrap();
+        assert_eq!(
+            value,
+            serde_json::from_str::<serde_json::Value>(json).unwrap()
+        );
+        let actions = [
+            HotkeyAction::VolumeDown(ChannelName::System),
+            HotkeyAction::ToggleMute(ChannelName::Sample),
+        ];
+        assert_eq!(
+            serde_json::to_string(&actions).unwrap(),
+            r#"[{"VolumeDown":"System"},{"ToggleMute":"Sample"}]"#
+        );
+    }
+
+    #[test]
+    fn loads_settings_without_hotkeys() {
+        let settings: Settings = serde_json::from_str(r#"{ "show_tray_icon": true }"#).unwrap();
+        assert!(settings.macos_hotkeys.is_empty());
     }
 }

@@ -143,6 +143,9 @@ pub enum DaemonCommand {
     SetMacOSAppRule(String, Option<usize>, u16, bool),
     RemoveMacOSAppRule(String),
     SetMacOSAppHidden(String, bool),
+
+    // Replaces the global hotkeys, which are only registered on macOS.
+    SetMacOSHotkeys(Vec<Binding>),
 }
 
 pub const MACOS_DEFAULT_VIRTUAL_AUDIO_ROUTES: u32 = 0xF002;

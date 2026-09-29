@@ -44,6 +44,8 @@ pub struct DaemonConfig {
     pub macos_virtual_audio_routes: u32,
     #[serde(default)]
     pub macos_app_audio: MacosAppAudio,
+    #[serde(default)]
+    pub macos_hotkeys: Vec<Binding>,
 }
 
 /// Per-app audio on macOS, empty on other platforms.
@@ -88,6 +90,33 @@ impl Default for MacosAppRule {
             muted: false,
         }
     }
+}
+
+/// A global hotkey on macOS. `code` is a web `KeyboardEvent.code` value, such as `KeyM`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Binding {
+    pub action: HotkeyAction,
+    pub code: String,
+    pub modifiers: HotkeyModifiers,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HotkeyAction {
+    /// Raise or lower a GoXLR channel's volume by 5 %.
+    VolumeUp(ChannelName),
+    VolumeDown(ChannelName),
+    /// Mute the channel's volume, or restore the level it had before.
+    ToggleMute(ChannelName),
+    /// Toggle the muted flag of the frontmost app's per-app rule.
+    ToggleFrontmostAppMute,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HotkeyModifiers {
+    pub command: bool,
+    pub option: bool,
+    pub control: bool,
+    pub shift: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

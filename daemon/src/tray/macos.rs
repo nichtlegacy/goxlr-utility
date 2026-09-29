@@ -36,13 +36,14 @@ use tokio::sync::mpsc::{Receiver, Sender, channel};
 use tokio::sync::oneshot;
 use tokio::time::{Instant, sleep_until};
 
-use goxlr_ipc::{GoXLRCommand, PathTypes};
+use goxlr_ipc::{DaemonCommand, GoXLRCommand, HotkeyAction, PathTypes};
 use goxlr_types::ChannelName;
 
 use crate::ICON_MAC;
 use crate::events::EventTriggers::Open;
 use crate::events::{DaemonState, EventTriggers};
 use crate::platform::macos::app_audio::{AppAudioHandle, PLAYBACK_NAMES, playback_route_enabled};
+use crate::platform::macos::hotkeys::{self, HotkeyPress};
 use crate::primary_worker::DeviceCommand;
 use crate::tray::macos::TrayOption::{
     Configure, OpenPathIcons, OpenPathLogs, OpenPathMicProfiles, OpenPathPresets, OpenPathProfiles,
@@ -70,6 +71,10 @@ const SCROLL_STEP: f64 = 1. / 50.;
 // Dragging a slider produces a stream of values, send at most one batch per interval.
 const COMMAND_INTERVAL: Duration = Duration::from_millis(30);
 const SAVE_DELAY: Duration = Duration::from_millis(300);
+
+// Volume hotkeys move a channel by 5 % of its range, unmuting without a previous level goes to 50 %.
+const HOTKEY_VOLUME_STEP: u8 = 13;
+const HOTKEY_UNMUTE_VOLUME: u8 = 128;
 
 #[derive(Clone)]
 struct TrayDevice {
@@ -112,6 +117,7 @@ pub fn handle_tray(state: DaemonState, tx: Sender<EventTriggers>) -> anyhow::Res
     let (tray_tx, tray_rx) = channel(10);
     tokio::spawn(run_tray(RunParams {
         tray_receiver: tray_rx,
+        hotkeys: hotkeys::listen(),
         event_sender: tx.clone(),
         state: state.clone(),
         link: link.clone(),
@@ -132,6 +138,7 @@ pub fn handle_tray(state: DaemonState, tx: Sender<EventTriggers>) -> anyhow::Res
 
 struct RunParams {
     tray_receiver: Receiver<TrayOption>,
+    hotkeys: Receiver<HotkeyPress>,
     event_sender: Sender<EventTriggers>,
     state: DaemonState,
     link: Arc<TrayLink>,
@@ -140,7 +147,10 @@ struct RunParams {
 async fn run_tray(mut p: RunParams) {
     let mut patches = p.state.broadcast_tx.subscribe();
     let mut save_at: Option<Instant> = None;
+    // The channel volumes before a mute hotkey, restored by the next one.
+    let mut muted_volumes: EnumMap<ChannelName, Option<u8>> = EnumMap::default();
     refresh_device(&p).await;
+    hotkeys::register_hotkeys(p.state.settings_handle.get_macos_hotkeys().await);
 
     loop {
         select! {
@@ -162,6 +172,10 @@ async fn run_tray(mut p: RunParams) {
             () = sleep_until(save_at.unwrap_or_else(Instant::now)), if save_at.is_some() => {
                 save_at = None;
                 p.state.settings_handle.save().await;
+            },
+            Some(press) = p.hotkeys.recv() => {
+                debug!("Received Hotkey! {:?}", press);
+                run_hotkey(&p, press, &mut muted_volumes).await;
             },
             Some(tray) = p.tray_receiver.recv() => {
                 debug!("Received Tray Message! {:?}", tray);
@@ -211,6 +225,59 @@ async fn refresh_device(p: &RunParams) {
             volumes: mixer.levels.volumes,
         });
     *p.link.device.lock().unwrap() = device;
+}
+
+async fn run_hotkey(
+    p: &RunParams,
+    press: HotkeyPress,
+    muted_volumes: &mut EnumMap<ChannelName, Option<u8>>,
+) {
+    let channel = match press.action {
+        HotkeyAction::VolumeUp(channel)
+        | HotkeyAction::VolumeDown(channel)
+        | HotkeyAction::ToggleMute(channel) => channel,
+        HotkeyAction::ToggleFrontmostAppMute => {
+            let Some(bundle_id) = press.frontmost else {
+                debug!("No frontmost app to mute");
+                return;
+            };
+            // Keep the route and volume, and go through the same path as the web UI.
+            let rules = p.state.settings_handle.get_macos_app_rules().await;
+            let rule = rules.get(&bundle_id).copied().unwrap_or_default();
+            let command =
+                DaemonCommand::SetMacOSAppRule(bundle_id, rule.route, rule.volume, !rule.muted);
+            let (tx, rx) = oneshot::channel();
+            let command = DeviceCommand::RunDaemonCommand(command, tx);
+            if p.state.usb_tx.send(command).await.is_ok() {
+                let _ = rx.await;
+            }
+            return;
+        }
+    };
+
+    // Like a slider, update the known volume straight away so repeated presses add up.
+    let volume = {
+        let mut device = p.link.device.lock().unwrap();
+        let Some(device) = device.as_mut() else {
+            debug!("No GoXLR for the volume hotkey");
+            return;
+        };
+        let current = device.volumes[channel];
+        device.volumes[channel] = match press.action {
+            HotkeyAction::VolumeUp(_) => current.saturating_add(HOTKEY_VOLUME_STEP),
+            HotkeyAction::VolumeDown(_) => current.saturating_sub(HOTKEY_VOLUME_STEP),
+            _ if current > 0 => {
+                muted_volumes[channel] = Some(current);
+                0
+            }
+            _ => muted_volumes[channel]
+                .take()
+                .unwrap_or(HOTKEY_UNMUTE_VOLUME),
+        };
+        device.volumes[channel]
+    };
+    p.link.pending.lock().unwrap().volumes[channel] = Some(volume);
+    p.link.changed.notify_one();
 }
 
 // Returns whether app routes or mutes, and app volumes were changed, so the caller can save them.

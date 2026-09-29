@@ -2,6 +2,7 @@ pub mod app_audio;
 mod audio_bridge;
 mod core_audio;
 mod device;
+pub mod hotkeys;
 pub mod runtime;
 
 use crate::ICON_MAC;
