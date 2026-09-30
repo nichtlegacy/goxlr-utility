@@ -62,6 +62,10 @@ pub struct MacosAppAudio {
     pub hidden: Vec<String>,
     /// The enabled virtual audio route mask.
     pub routes: u32,
+    /// Running per-app mixers (FineTune, fader, ...) that re-play apps' audio from their own
+    /// process, so rules here don't reach the apps they control.
+    #[serde(default)]
+    pub mixers: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

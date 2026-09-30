@@ -16,7 +16,7 @@ use tokio::time;
 
 use crate::platform::macos::app_audio::{
     AppAudioHandle, AppAudioSnapshot, AudioApp, BridgeSignal, LEVEL_INTERVAL, ProcessWatch,
-    installed_app_name, list_audio_apps, rules_string,
+    installed_app_name, list_audio_apps, rules_string, running_mixers,
 };
 use crate::platform::macos::core_audio::{
     get_device_id_for_uid, get_goxlr_devices, get_virtual_audio_app_rules,
@@ -484,6 +484,7 @@ fn sync_app_rules(
         names: handle.block_on(settings.get_macos_app_names()),
         hidden: handle.block_on(settings.get_macos_hidden_apps()),
         routes,
+        mixers: running_mixers(),
     });
     // Compare with what the plug-in actually holds, a restarted coreaudiod reloads it empty.
     if applied.as_deref() != Some(value.as_str())

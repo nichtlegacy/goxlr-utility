@@ -62,6 +62,30 @@ pub struct AppAudioSnapshot {
     pub names: HashMap<String, String>,
     pub hidden: Vec<String>,
     pub routes: u32,
+    pub mixers: Vec<String>,
+}
+
+/// Per-app mixers that tap apps and play their audio again from their own process. While one
+/// controls an app, coreaudiod sees the mixer rather than the app on our devices.
+const TAPPING_MIXERS: [(&str, &str); 4] = [
+    ("com.finetuneapp.FineTune", "FineTune"),
+    ("dev.pantafive.fader", "fader"),
+    ("com.rogueamoeba.soundsource", "SoundSource"),
+    ("com.bearisdriving.BGM.App", "Background Music"),
+];
+
+/// Names of the tapping mixers that are running right now.
+pub(crate) fn running_mixers() -> Vec<String> {
+    autoreleasepool(|_| {
+        TAPPING_MIXERS
+            .iter()
+            .filter(|(bundle_id, _)| {
+                let id = objc2_foundation::NSString::from_str(bundle_id);
+                NSRunningApplication::runningApplicationsWithBundleIdentifier(&id).count() > 0
+            })
+            .map(|(_, name)| (*name).to_owned())
+            .collect()
+    })
 }
 
 pub(crate) enum BridgeSignal {
@@ -278,6 +302,7 @@ pub async fn app_audio_status(
         names: settings.get_macos_app_names().await,
         hidden: settings.get_macos_hidden_apps().await,
         routes: settings.get_macos_virtual_audio_routes().await,
+        mixers: app_audio.snapshot().mixers,
     }
 }
 
@@ -654,8 +679,14 @@ mod tests {
     #[test]
     fn looks_up_installed_app_names() {
         // Finder is always installed; an unknown bundle has no app.
-        assert_eq!(super::installed_app_name("com.apple.finder").as_deref(), Some("Finder"));
-        assert_eq!(super::installed_app_name("invalid.goxlr.not-installed"), None);
+        assert_eq!(
+            super::installed_app_name("com.apple.finder").as_deref(),
+            Some("Finder")
+        );
+        assert_eq!(
+            super::installed_app_name("invalid.goxlr.not-installed"),
+            None
+        );
     }
 
     #[test]
@@ -808,6 +839,7 @@ mod tests {
             names: HashMap::from([("com.spotify.client".to_string(), "Spotify".to_string())]),
             hidden: vec!["com.apple.siri".into()],
             routes: 61442,
+            mixers: vec!["FineTune".into()],
         };
         let value = serde_json::to_value(&status).unwrap();
         println!("{value}");
@@ -819,9 +851,19 @@ mod tests {
                 "rules": {"com.spotify.client": {"route": 3, "volume": 100, "muted": false}},
                 "names": {"com.spotify.client": "Spotify"},
                 "hidden": ["com.apple.siri"],
-                "routes": 61442
+                "routes": 61442,
+                "mixers": ["FineTune"]
             })
         );
+    }
+
+    #[test]
+    fn detects_running_mixers_by_bundle_id() {
+        // None of the known mixers has to be running, but the lookup must not fail or report
+        // apps that aren't in the list.
+        for name in super::running_mixers() {
+            assert!(super::TAPPING_MIXERS.iter().any(|(_, known)| *known == name));
+        }
     }
 
     #[test]

@@ -806,6 +806,14 @@ impl UtilityDelegate {
         }
 
         menu.addItem(&App::get_header(mtm, "Apps"));
+        // A tapping mixer plays the apps it controls from its own process, so rules set here
+        // don't reach them; say so rather than silently not working.
+        for mixer in &snapshot.mixers {
+            menu.addItem(&App::get_header(
+                mtm,
+                &format!("{mixer} is running, it overrides apps it controls"),
+            ));
+        }
         let apps: Vec<_> = snapshot
             .apps
             .iter()
