@@ -16,7 +16,7 @@ use tokio::time;
 
 use crate::platform::macos::app_audio::{
     AppAudioHandle, AppAudioSnapshot, AudioApp, BridgeSignal, LEVEL_INTERVAL, ProcessWatch,
-    list_audio_apps, rules_string,
+    installed_app_name, list_audio_apps, rules_string,
 };
 use crate::platform::macos::core_audio::{
     get_device_id_for_uid, get_goxlr_devices, get_virtual_audio_app_rules,
@@ -460,9 +460,21 @@ fn sync_app_rules(
     let rules = handle.block_on(settings.get_macos_app_rules());
     let value = rules_string(apps, &rules);
     // Keep the names of apps with rules, so the UI can list them while they aren't running.
+    // Rules without a name yet (e.g. saved before names were kept) take the installed app's.
+    let known = handle.block_on(settings.get_macos_app_names());
+    let installed: Vec<(String, String)> = rules
+        .keys()
+        .filter(|id| !known.contains_key(*id) && !apps.iter().any(|app| &app.bundle_id == *id))
+        .filter_map(|id| installed_app_name(id).map(|name| (id.clone(), name)))
+        .collect();
     let seen = apps
         .iter()
-        .map(|app| (app.bundle_id.as_str(), app.name.as_str()));
+        .map(|app| (app.bundle_id.as_str(), app.name.as_str()))
+        .chain(
+            installed
+                .iter()
+                .map(|(id, name)| (id.as_str(), name.as_str())),
+        );
     if handle.block_on(settings.remember_macos_app_names(seen)) {
         handle.block_on(settings.save());
     }

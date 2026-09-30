@@ -504,6 +504,39 @@ fn app_bundle_info(path: &str) -> Option<(String, String)> {
     Some((bundle_id, name))
 }
 
+#[link(name = "CoreServices", kind = "framework")]
+unsafe extern "C" {
+    fn LSCopyApplicationURLsForBundleIdentifier(
+        bundle_id: CFStringRef,
+        error: *mut *const c_void,
+    ) -> core_foundation::array::CFArrayRef;
+}
+
+/// Looks up the display name of an installed app that isn't running, e.g. one with a rule saved
+/// before its name was recorded. Each bundle ID is only looked up once per daemon run.
+pub(crate) fn installed_app_name(bundle_id: &str) -> Option<String> {
+    static LOOKED_UP: OnceLock<Mutex<HashMap<String, Option<String>>>> = OnceLock::new();
+    let cache = LOOKED_UP.get_or_init(Default::default);
+    if let Some(name) = cache.lock().unwrap().get(bundle_id) {
+        return name.clone();
+    }
+
+    let id = CFString::new(bundle_id);
+    let urls = unsafe {
+        LSCopyApplicationURLsForBundleIdentifier(id.as_concrete_TypeRef(), ptr::null_mut())
+    };
+    let name = (!urls.is_null())
+        .then(|| unsafe { core_foundation::array::CFArray::<CFURL>::wrap_under_create_rule(urls) })
+        .and_then(|urls| urls.get(0).and_then(|url| url.to_path()))
+        .and_then(|path| app_bundle_info(&path.to_string_lossy()))
+        .map(|(_, name)| name);
+    cache
+        .lock()
+        .unwrap()
+        .insert(bundle_id.to_owned(), name.clone());
+    name
+}
+
 /// Returns the bundle ID and name of the app a process belongs to.
 fn identify(object: AudioObjectID, pid: i32) -> Option<(String, String)> {
     let owner = responsible_pid(pid);
@@ -617,6 +650,13 @@ mod tests {
     use goxlr_ipc::{MacosAppAudio, MacosAudioApp};
     use std::collections::HashMap;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn looks_up_installed_app_names() {
+        // Finder is always installed; an unknown bundle has no app.
+        assert_eq!(super::installed_app_name("com.apple.finder").as_deref(), Some("Finder"));
+        assert_eq!(super::installed_app_name("invalid.goxlr.not-installed"), None);
+    }
 
     #[test]
     fn helpers_belong_to_their_outer_app() {
