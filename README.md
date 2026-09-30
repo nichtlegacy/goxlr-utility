@@ -43,7 +43,12 @@ remain as a fallback.
   the apps playing to a GoXLR output. Each app can be moved to another GoXLR output and given its
   own volume; the choice is saved per app. The routing happens inside the driver, so it needs no
   process taps or audio capture permission. It applies to apps that play to a GoXLR device, such
-  as the system default output.
+  as the system default output. Apps can be muted or boosted up to 200 % (with a soft limiter),
+  and all sliders follow the scroll wheel.
+- An **Apps** tab in the Utility with the same controls plus a level meter per app, rules for apps
+  that aren't running, and hidden apps.
+- Global **keyboard shortcuts** (System tab) to raise, lower, or mute a GoXLR channel and to mute
+  the frontmost app. They use Carbon hotkeys, so no Accessibility permission is needed.
 
 The default devices are **GoXLR Microphone** (input) and **GoXLR System**, **Game**, **Chat**, and
 **Music** (outputs). The GoXLR Full's remaining capture routes and Sample output can be enabled in
