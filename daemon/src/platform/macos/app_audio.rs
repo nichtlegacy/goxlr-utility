@@ -8,7 +8,9 @@ use std::{mem, ptr};
 
 use anyhow::{Result, bail};
 use core_foundation::base::TCFType;
+use core_foundation::bundle::CFBundle;
 use core_foundation::string::{CFString, CFStringRef};
+use core_foundation::url::CFURL;
 use coreaudio_sys::{
     AudioObjectAddPropertyListener, AudioObjectGetPropertyData, AudioObjectGetPropertyDataSize,
     AudioObjectID, AudioObjectPropertyAddress, AudioObjectPropertyScope,
@@ -471,9 +473,53 @@ fn is_system_process(pid: i32) -> bool {
             .any(|prefix| buffer[..length as usize].starts_with(prefix.as_bytes()))
 }
 
+const OWN_BUNDLE_ID: &str = "com.github.goxlr-on-linux.goxlr-utility";
+
+fn process_path(pid: i32) -> Option<String> {
+    let mut buffer = [0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    let length =
+        unsafe { libc::proc_pidpath(pid, buffer.as_mut_ptr() as *mut c_void, buffer.len() as u32) };
+    (length > 0).then(|| String::from_utf8_lossy(&buffer[..length as usize]).into_owned())
+}
+
+/// The outermost `.app` bundle in a path, e.g. `Google Chrome.app` for its helpers.
+fn outer_app_path(path: &str) -> Option<&str> {
+    path.find(".app/").map(|end| &path[..end + ".app".len()])
+}
+
+/// Reads the bundle ID and display name of an app bundle on disk.
+fn app_bundle_info(path: &str) -> Option<(String, String)> {
+    let url = CFURL::from_path(path, true)?;
+    let bundle = CFBundle::new(url)?;
+    let info = bundle.info_dictionary();
+    let string = |key: &str| {
+        info.find(CFString::new(key))
+            .and_then(|value| value.downcast::<CFString>())
+            .map(|value| value.to_string())
+    };
+    let bundle_id = string("CFBundleIdentifier")?;
+    let name = string("CFBundleDisplayName")
+        .or_else(|| string("CFBundleName"))
+        .unwrap_or_else(|| bundle_id.clone());
+    Some((bundle_id, name))
+}
+
 /// Returns the bundle ID and name of the app a process belongs to.
 fn identify(object: AudioObjectID, pid: i32) -> Option<(String, String)> {
     let owner = responsible_pid(pid);
+
+    // Helpers that macOS doesn't attribute to their app (e.g. when the app wasn't started
+    // through Launch Services) still live inside it, so use the outermost app bundle.
+    if let Some(path) = process_path(owner)
+        && let Some(app_path) = outer_app_path(&path)
+        && !path[app_path.len()..]
+            .trim_start_matches('/')
+            .starts_with("Contents/MacOS/")
+        && let Some(info) = app_bundle_info(app_path)
+    {
+        return Some(info);
+    }
+
     for candidate in [owner, pid] {
         if let Some(app) = NSRunningApplication::runningApplicationWithProcessIdentifier(candidate)
             && let Some(bundle_id) = app.bundleIdentifier()
@@ -518,6 +564,10 @@ pub fn list_audio_apps() -> Result<Vec<AudioApp>> {
             let Some((bundle_id, name)) = identify(object, pid) else {
                 continue;
             };
+            // The Utility's own UI (and its WebKit helpers) isn't something to route.
+            if bundle_id == OWN_BUNDLE_ID || name.starts_with("goxlr-utility-ui") {
+                continue;
+            }
             let playing =
                 read_u32(object, kAudioProcessPropertyIsRunningOutput).is_some_and(|v| v != 0);
             let device_route = read_array(
@@ -560,13 +610,29 @@ pub fn list_audio_apps() -> Result<Vec<AudioApp>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AudioApp, LevelCache, MAX_APP_RULES, levels_by_app, list_audio_apps,
-        playback_route_for_uid, rules_string,
+        AudioApp, LevelCache, MAX_APP_RULES, app_bundle_info, levels_by_app, list_audio_apps,
+        outer_app_path, playback_route_for_uid, rules_string,
     };
     use crate::settings::MacosAppRule;
     use goxlr_ipc::{MacosAppAudio, MacosAudioApp};
     use std::collections::HashMap;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn helpers_belong_to_their_outer_app() {
+        let helper = "/Applications/Google Chrome.app/Contents/Frameworks/Google Chrome \
+                      Framework.framework/Helpers/Google Chrome Helper.app/Contents/MacOS/\
+                      Google Chrome Helper";
+        assert_eq!(
+            outer_app_path(helper),
+            Some("/Applications/Google Chrome.app")
+        );
+        assert_eq!(outer_app_path("/usr/bin/afplay"), None);
+        // The Utility itself is a real bundle on this machine, check it reads.
+        if let Some((bundle_id, _)) = app_bundle_info("/Applications/GoXLR Utility.app") {
+            assert_eq!(bundle_id, "com.github.goxlr-on-linux.goxlr-utility");
+        }
+    }
 
     fn rule(route: Option<usize>, volume: u16, muted: bool) -> MacosAppRule {
         MacosAppRule {
