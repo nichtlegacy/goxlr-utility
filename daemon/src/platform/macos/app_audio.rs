@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use std::{mem, ptr};
 
 use anyhow::{Result, bail};
@@ -17,6 +19,7 @@ use coreaudio_sys::{
     kAudioProcessPropertyDevices, kAudioProcessPropertyIsRunningOutput, kAudioProcessPropertyPID,
 };
 use goxlr_ipc::{MacosAppAudio, MacosAudioApp};
+use log::warn;
 use objc2::rc::autoreleasepool;
 use objc2_app_kit::NSRunningApplication;
 use tokio::sync::Notify;
@@ -27,6 +30,17 @@ use crate::settings::{MacosAppRule, SettingsHandle, apply_app_rule};
 
 /// The visible GoXLR playback devices, in playback route order.
 pub const PLAYBACK_NAMES: [&str; 5] = ["System", "Game", "Chat", "Music", "Sample"];
+
+/// The most rules the plug-in holds (`kMaxRules` in the driver's `AppRouting.hpp`).
+pub const MAX_APP_RULES: usize = 128;
+
+/// How often the bridge reads the plug-in's levels while someone is asking for them.
+pub(crate) const LEVEL_INTERVAL: Duration = Duration::from_millis(50);
+// The bridge keeps reading levels this long after the last request.
+const LEVELS_WANTED_FOR: Duration = Duration::from_secs(2);
+// A cached peak halves every this often, so a client polling slower than the bridge reads
+// still sees short peaks.
+const LEVEL_HALF_LIFE: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AudioApp {
@@ -54,6 +68,8 @@ pub(crate) enum BridgeSignal {
     Refresh,
     // coreaudiod's process list changed, so an app may have started or stopped using audio.
     AppsChanged,
+    // A client asked for levels after none did for a while, start reading them.
+    Levels,
 }
 
 const PROCESS_LIST: AudioObjectPropertyAddress = AudioObjectPropertyAddress {
@@ -115,12 +131,62 @@ extern "C" fn process_list_changed(
     kAudioHardwareNoError as OSStatus
 }
 
+/// The latest peak of each app, decaying from when it was read. `gxlv` resets on every read,
+/// so only the bridge reads it and every client is answered from here.
+#[derive(Debug, Default)]
+struct LevelCache {
+    requested: Option<Instant>,
+    peaks: HashMap<String, (f32, Instant)>,
+}
+
+fn decayed(peak: f32, since: Instant, now: Instant) -> f32 {
+    let elapsed = now.saturating_duration_since(since).as_secs_f32();
+    peak * 0.5f32.powf(elapsed / LEVEL_HALF_LIFE.as_secs_f32())
+}
+
+impl LevelCache {
+    fn wanted(&self, now: Instant) -> bool {
+        self.requested
+            .is_some_and(|at| now.saturating_duration_since(at) < LEVELS_WANTED_FOR)
+    }
+
+    // Marks the levels as wanted and returns whether they weren't already.
+    fn request(&mut self, now: Instant) -> bool {
+        let started = !self.wanted(now);
+        if started {
+            self.peaks.clear();
+        }
+        self.requested = Some(now);
+        started
+    }
+
+    fn record(&mut self, levels: HashMap<String, f32>, now: Instant) {
+        self.peaks
+            .retain(|_, (peak, at)| decayed(*peak, *at, now) > 0.001);
+        for (bundle_id, level) in levels {
+            let entry = self.peaks.entry(bundle_id).or_insert((0.0, now));
+            if level >= decayed(entry.0, entry.1, now) {
+                *entry = (level, now);
+            }
+        }
+    }
+
+    fn levels(&self, now: Instant) -> HashMap<String, f32> {
+        self.peaks
+            .iter()
+            .map(|(bundle_id, (peak, at))| (bundle_id.clone(), decayed(*peak, *at, now)))
+            .filter(|(_, level)| *level > 0.001)
+            .collect()
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct AppAudioHandle {
     snapshot: Arc<Mutex<AppAudioSnapshot>>,
     bridge: Arc<Mutex<Option<Sender<BridgeSignal>>>>,
     // Wakes the primary worker to refresh the daemon status when the snapshot changes.
     changed: Arc<Notify>,
+    levels: Arc<Mutex<LevelCache>>,
 }
 
 impl AppAudioHandle {
@@ -161,11 +227,29 @@ impl AppAudioHandle {
         self.changed.notify_one();
     }
 
-    /// Reads the peak level of each app since the last call, from 0 to 1. This asks
-    /// coreaudiod, so it can block.
-    pub fn take_levels(&self) -> Result<HashMap<String, f32>> {
-        let levels = get_virtual_audio_app_levels()?;
-        Ok(levels_by_app(&self.snapshot.lock().unwrap().apps, &levels))
+    /// The recent peak level of each app, from 0 to 1, without asking coreaudiod. The bridge
+    /// reads the levels while any client asked for them in the last 2 seconds.
+    pub fn levels(&self) -> HashMap<String, f32> {
+        let now = Instant::now();
+        let mut cache = self.levels.lock().unwrap();
+        if cache.request(now)
+            && let Some(bridge) = self.bridge.lock().unwrap().as_ref()
+        {
+            let _ = bridge.send(BridgeSignal::Levels);
+        }
+        cache.levels(now)
+    }
+
+    pub(crate) fn levels_wanted(&self) -> bool {
+        self.levels.lock().unwrap().wanted(Instant::now())
+    }
+
+    /// Reads the plug-in's levels (which resets them) into the cache. Called on the bridge
+    /// thread, as it asks coreaudiod and can block.
+    pub(crate) fn sample_levels(&self, apps: &[AudioApp]) -> Result<()> {
+        let levels = levels_by_app(apps, &get_virtual_audio_app_levels()?);
+        self.levels.lock().unwrap().record(levels, Instant::now());
+        Ok(())
     }
 }
 
@@ -225,8 +309,11 @@ fn playback_route_for_uid(uid: &str) -> Option<usize> {
     PLAYBACK_NAMES.iter().position(|route| *route == name)
 }
 
-/// Builds the plug-in's rule table for every process of every app that has a rule.
+/// Builds the plug-in's rule table for every process of every app that has a rule, keeping the
+/// lowest `MAX_APP_RULES` PIDs.
 pub fn rules_string(apps: &[AudioApp], rules: &HashMap<String, MacosAppRule>) -> String {
+    static WARNED: AtomicBool = AtomicBool::new(false);
+
     let mut entries = Vec::new();
     for app in apps {
         let Some(rule) = rules.get(&app.bundle_id) else {
@@ -249,6 +336,13 @@ pub fn rules_string(apps: &[AudioApp], rules: &HashMap<String, MacosAppRule>) ->
         );
     }
     entries.sort();
+    if entries.len() > MAX_APP_RULES && !WARNED.swap(true, Ordering::Relaxed) {
+        warn!(
+            "{} app processes have audio rules, only the first {MAX_APP_RULES} are applied",
+            entries.len()
+        );
+    }
+    entries.truncate(MAX_APP_RULES);
     entries
         .into_iter()
         .map(|(_, entry)| entry)
@@ -465,10 +559,14 @@ pub fn list_audio_apps() -> Result<Vec<AudioApp>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AudioApp, levels_by_app, list_audio_apps, playback_route_for_uid, rules_string};
+    use super::{
+        AudioApp, LevelCache, MAX_APP_RULES, levels_by_app, list_audio_apps,
+        playback_route_for_uid, rules_string,
+    };
     use crate::settings::MacosAppRule;
     use goxlr_ipc::{MacosAppAudio, MacosAudioApp};
     use std::collections::HashMap;
+    use std::time::{Duration, Instant};
 
     fn rule(route: Option<usize>, volume: u16, muted: bool) -> MacosAppRule {
         MacosAppRule {
@@ -532,6 +630,49 @@ mod tests {
             ("com.apple.Safari".to_string(), rule(None, 900, false)),
         ]);
         assert_eq!(rules_string(&apps, &rules), "12:-:2000;77:3:0;90:-:2000");
+    }
+
+    #[test]
+    fn caps_rules_at_what_the_plug_in_holds() {
+        let apps = [app(
+            "com.google.Chrome",
+            (1..=MAX_APP_RULES as i32 + 5).collect(),
+        )];
+        let rules = HashMap::from([("com.google.Chrome".to_string(), rule(Some(1), 50, false))]);
+        let value = rules_string(&apps, &rules);
+        let entries: Vec<_> = value.split(';').collect();
+        assert_eq!(entries.len(), MAX_APP_RULES);
+        assert_eq!(
+            entries.last(),
+            Some(&format!("{MAX_APP_RULES}:1:500").as_str())
+        );
+    }
+
+    #[test]
+    fn caches_decaying_levels_while_wanted() {
+        let start = Instant::now();
+        let at = |millis| start + Duration::from_millis(millis);
+        let mut cache = LevelCache::default();
+        assert!(!cache.wanted(start));
+        assert!(cache.request(start));
+        assert!(!cache.request(at(1500)));
+        assert!(cache.wanted(at(3000)) && !cache.wanted(at(3600)));
+
+        cache.record(HashMap::from([("a".to_string(), 0.8)]), at(1500));
+        // Every client reading sees the same peak, halving every 100 ms.
+        assert_eq!(cache.levels(at(1500))["a"], 0.8);
+        assert_eq!(cache.levels(at(1500))["a"], 0.8);
+        assert!((cache.levels(at(1600))["a"] - 0.4).abs() < 1e-4);
+        // A quieter read doesn't replace a louder peak that hasn't decayed below it.
+        cache.record(HashMap::from([("a".to_string(), 0.3)]), at(1550));
+        assert!(cache.levels(at(1550))["a"] > 0.5);
+        cache.record(HashMap::from([("a".to_string(), 0.3)]), at(1700));
+        assert_eq!(cache.levels(at(1700))["a"], 0.3);
+        // Silent apps fall out, and a new request after an idle spell starts empty.
+        assert!(cache.levels(at(3000)).is_empty());
+        cache.record(HashMap::from([("b".to_string(), 1.0)]), at(3000));
+        assert!(cache.request(at(5000)));
+        assert!(cache.levels(at(5000)).is_empty());
     }
 
     #[test]

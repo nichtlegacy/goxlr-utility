@@ -228,9 +228,12 @@ fn modifier_mask(modifiers: HotkeyModifiers) -> u32 {
     .fold(0, |mask, (_, key)| mask | key)
 }
 
-// Every hotkey needs a modifier, except on the F13 - F19 keys that nothing else uses.
+// Every hotkey needs Command, Option or Control (Shift alone would take a key from typing),
+// except on the F13 - F19 keys that nothing else uses.
 fn is_valid(code: &str, modifiers: HotkeyModifiers) -> bool {
-    modifiers != HotkeyModifiers::default()
+    modifiers.command
+        || modifiers.option
+        || modifiers.control
         || matches!(code, "F13" | "F14" | "F15" | "F16" | "F17" | "F18" | "F19")
 }
 
@@ -411,14 +414,19 @@ mod tests {
     }
 
     #[test]
-    fn requires_a_modifier_except_on_f13_to_f19() {
+    fn requires_command_option_or_control_except_on_f13_to_f19() {
         let none = HotkeyModifiers::default();
         assert!(!is_valid("KeyM", none));
         assert!(!is_valid("F12", none));
         assert!(!is_valid("F20", none));
         assert!(is_valid("F13", none));
         assert!(is_valid("F19", none));
-        assert!(is_valid("KeyM", modifiers(false, false, false, true)));
+        let shift = modifiers(false, false, false, true);
+        assert!(!is_valid("KeyM", shift));
+        assert!(!is_valid("F12", shift));
+        assert!(is_valid("F13", shift));
+        assert!(is_valid("KeyM", modifiers(true, false, false, false)));
+        assert!(is_valid("KeyM", modifiers(false, false, true, true)));
         assert!(is_valid("ArrowUp", modifiers(false, true, true, false)));
     }
 }

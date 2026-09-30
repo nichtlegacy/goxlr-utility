@@ -193,6 +193,11 @@ async fn run_tray(mut p: RunParams) {
                 };
             },
             () = p.state.shutdown.recv() => {
+                // Don't lose a slider or menu change that hasn't been applied or saved yet.
+                let (toggles, volumes) = apply_changes(&p).await;
+                if toggles || volumes || save_at.is_some() {
+                    p.state.settings_handle.save().await;
+                }
                debug!("Shutting Down, Attempting to kill the NSApp..");
                 unsafe {
                     stop_ns_application();

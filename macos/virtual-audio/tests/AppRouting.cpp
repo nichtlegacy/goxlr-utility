@@ -1,6 +1,9 @@
 #include "AppRouting.hpp"
 
+#include <atomic>
 #include <cassert>
+#include <string>
+#include <thread>
 #include <vector>
 
 using namespace app_routing;
@@ -34,6 +37,13 @@ int main() {
     assert(!parseRules("abc:1:500"));
     assert(!parseRules("101:1"));
 
+    // Entries past kMaxRules are ignored rather than rejecting the whole table.
+    std::string many;
+    for (int pid = 1; pid <= int(kMaxRules) + 2; ++pid) many += std::to_string(pid) + ":1:500;";
+    auto capped = parseRules(many);
+    assert(capped && capped->size() == kMaxRules && capped->back().pid == pid_t(kMaxRules));
+    assert(!parseRules(many + "bad"));
+
     // Rule table lookup, including shrinking.
     RuleTable table;
     table.apply(*rules);
@@ -43,6 +53,30 @@ int main() {
     table.apply({{202, 1, 250}});
     assert(!table.lookup(101, route, gain));
     assert(table.lookup(202, route, gain) && route == 1 && gain == 250);
+
+    // A lookup racing applies sees the old or the new rules, never a table in between: PID 7 is
+    // in both, behind a different number of other rules, with a different gain.
+    {
+        std::vector<Rule> before, after;
+        for (pid_t pid = 100; pid < 110; ++pid) before.push_back({pid, kKeepRoute, 1000});
+        before.push_back({7, 1, 300});
+        after.push_back({7, 2, 600});
+        RuleTable racing;
+        racing.apply(before);
+        std::atomic<bool> done{false};
+        std::thread writer([&] {
+            for (int i = 0; i < 20000; ++i) racing.apply(i % 2 ? before : after);
+            done = true;
+        });
+        size_t lookups = 0;
+        while (!done || lookups < 1000) {
+            uint32_t r = 0, g = 0;
+            assert(racing.lookup(7, r, g));
+            assert((r == 1 && g == 300) || (r == 2 && g == 600));
+            ++lookups;
+        }
+        writer.join();
+    }
 
     // Clients without a rule, or kept on their route, stay in the mix (scaled by their gain).
     Router router;
@@ -90,19 +124,47 @@ int main() {
     router.processClientOutput(0, 40, kept.data(), 4, 768, kAllRoutes & ~(1u << 3));
     assert(kept == constant(4, 1, 1));
 
+    // A source with a large IO cycle (2048 frames) moved to a route read in 512 frame cycles
+    // arrives complete and in order.
+    {
+        Router large;
+        large.setRules({{55, 1, 1000}});
+        auto cursors = large.cursorsFor(1);
+        std::vector<float> read(512 * 2);
+        float expected = 0;
+        for (uint32_t cycle = 0; cycle < 8; ++cycle) {
+            std::vector<float> block(2048 * 2);
+            for (uint32_t i = 0; i < 2048; ++i) {
+                block[i * 2] = float(cycle * 2048 + i);
+                block[i * 2 + 1] = -float(cycle * 2048 + i);
+            }
+            large.processClientOutput(0, 55, block.data(), 2048, cycle * 2048.0, kAllRoutes);
+            large.flush(0, cycle * 2048.0);
+            for (uint32_t part = 0; part < 4; ++part) {
+                std::fill(read.begin(), read.end(), 0.0f);
+                large.mixInjected(1, cursors, read.data(), 512, scratch.data());
+                for (uint32_t i = 0; i < 512; ++i) {
+                    assert(read[i * 2] == expected && read[i * 2 + 1] == -expected);
+                    expected += 1;
+                }
+            }
+        }
+        assert(expected == 8 * 2048);
+    }
+
     // A reader that fell far behind skips ahead instead of replaying old audio.
     Router lagging;
     lagging.setRules({{50, 1, 1000}});
     auto gameCursors = lagging.cursorsFor(1);
-    for (uint32_t cycle = 0; cycle < 12; ++cycle) {
+    for (uint32_t cycle = 0; cycle < 40; ++cycle) {
         auto block = constant(256, float(cycle), 0);
         lagging.processClientOutput(0, 50, block.data(), 256, cycle * 256.0, kAllRoutes);
         lagging.flush(0, cycle * 256.0);
     }
     auto game = constant(4, 0, 0);
     lagging.mixInjected(1, gameCursors, game.data(), 4, scratch.data());
-    assert(gameCursors.fromRoute[0].nextFrame == 12 * 256 - kResyncLag + 4);
-    assert(game[0] == 11.0f);
+    assert(gameCursors.fromRoute[0].nextFrame == 40 * 256 - kResyncLag + 4);
+    assert(game[0] == 39.0f);
 
     // Boost is exact below the limiter's knee and stays between the knee and 1.0 above it;
     // mute writes exact zeros, also for a moved client.

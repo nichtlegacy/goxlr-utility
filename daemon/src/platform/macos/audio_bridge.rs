@@ -15,8 +15,8 @@ use tokio::sync::oneshot;
 use tokio::time;
 
 use crate::platform::macos::app_audio::{
-    AppAudioHandle, AppAudioSnapshot, AudioApp, BridgeSignal, ProcessWatch, list_audio_apps,
-    rules_string,
+    AppAudioHandle, AppAudioSnapshot, AudioApp, BridgeSignal, LEVEL_INTERVAL, ProcessWatch,
+    list_audio_apps, rules_string,
 };
 use crate::platform::macos::core_audio::{
     get_device_id_for_uid, get_goxlr_devices, get_virtual_audio_app_rules,
@@ -32,6 +32,8 @@ pub(crate) const CAPTURE_COUNT: usize = 12;
 const PLAYBACK_COUNT: usize = 5;
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(60);
 const TICK: Duration = Duration::from_secs(2);
+// An app opening audio changes the process list several times in a row, list them once.
+const APPS_CHANGED_DEBOUNCE: Duration = Duration::from_millis(100);
 
 #[derive(Clone, Copy)]
 struct CaptureRoute {
@@ -483,6 +485,19 @@ fn sync_app_rules(
     Ok(())
 }
 
+// Waits out a burst of signals after an AppsChanged. Everything but a stop is covered by the
+// listing and rule sync that follow; returns false if a stop arrived.
+fn debounce_apps_changed(signals: &std_mpsc::Receiver<BridgeSignal>) -> bool {
+    let deadline = Instant::now() + APPS_CHANGED_DEBOUNCE;
+    loop {
+        match signals.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(BridgeSignal::Stop) | Err(RecvTimeoutError::Disconnected) => return false,
+            Ok(_) => {}
+            Err(RecvTimeoutError::Timeout) => return true,
+        }
+    }
+}
+
 fn bridge_loop(
     handle: &Handle,
     settings: &SettingsHandle,
@@ -503,14 +518,25 @@ fn bridge_loop(
     let mut failures = 0u32;
     let mut retry_at: Option<Instant> = None;
     let mut next_tick = Instant::now();
-    // Tick every 2 seconds until a stop is sent (or the sender goes away).
+    let mut next_levels = Instant::now();
+    // Tick every 2 seconds until a stop is sent (or the sender goes away), and read the app
+    // levels in between while a client wants them.
     loop {
-        match signals.recv_timeout(next_tick.saturating_duration_since(Instant::now())) {
+        let now = Instant::now();
+        let mut wait = next_tick.saturating_duration_since(now);
+        if app_audio.levels_wanted() {
+            wait = wait.min(next_levels.saturating_duration_since(now));
+        }
+        match signals.recv_timeout(wait) {
             Err(RecvTimeoutError::Timeout) => {}
+            Ok(BridgeSignal::Levels) => continue,
             Ok(signal @ (BridgeSignal::Refresh | BridgeSignal::AppsChanged)) => {
                 // A rule changed in the tray (apply it to the apps we already know about), or
                 // an app started or stopped using audio (list them again first).
                 if matches!(signal, BridgeSignal::AppsChanged) {
+                    if !debounce_apps_changed(signals) {
+                        break;
+                    }
                     match list_audio_apps() {
                         Ok(list) => apps = list,
                         Err(error) => debug!("Unable to list audio apps: {error}"),
@@ -531,6 +557,18 @@ fn bridge_loop(
                 continue;
             }
             Ok(BridgeSignal::Stop) | Err(RecvTimeoutError::Disconnected) => break,
+        }
+        if app_audio.levels_wanted() && Instant::now() >= next_levels {
+            next_levels = Instant::now() + LEVEL_INTERVAL;
+            // Without the plug-in there's nothing to read.
+            if ids.is_some()
+                && let Err(error) = app_audio.sample_levels(&apps)
+            {
+                debug!("Unable to read app levels: {error}");
+            }
+        }
+        if Instant::now() < next_tick {
+            continue;
         }
         next_tick = Instant::now() + TICK;
 
@@ -658,8 +696,31 @@ fn bridge_loop(
 
 #[cfg(test)]
 mod tests {
-    use super::{CAPTURE_ROUTES, PLAYBACK_ROUTES, StereoReader, capture_pair, set_pair};
+    use super::{
+        BridgeSignal, CAPTURE_ROUTES, PLAYBACK_ROUTES, StereoReader, capture_pair,
+        debounce_apps_changed, set_pair,
+    };
     use rtrb::RingBuffer;
+    use std::sync::mpsc;
+
+    #[test]
+    fn debounces_app_changes_but_not_stops() {
+        let (sender, signals) = mpsc::channel();
+        for _ in 0..3 {
+            sender.send(BridgeSignal::AppsChanged).unwrap();
+        }
+        sender.send(BridgeSignal::Refresh).unwrap();
+        assert!(debounce_apps_changed(&signals));
+        assert!(signals.try_recv().is_err());
+
+        sender.send(BridgeSignal::AppsChanged).unwrap();
+        sender.send(BridgeSignal::Stop).unwrap();
+        sender.send(BridgeSignal::AppsChanged).unwrap();
+        assert!(!debounce_apps_changed(&signals));
+
+        drop(sender);
+        assert!(!debounce_apps_changed(&signals));
+    }
 
     #[test]
     fn routes_every_physical_channel_once() {

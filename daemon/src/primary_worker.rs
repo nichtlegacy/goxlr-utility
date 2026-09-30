@@ -759,9 +759,9 @@ async fn get_daemon_status(
             macos_virtual_audio_routes: settings.get_macos_virtual_audio_routes().await,
             macos_app_audio: get_app_audio_status(app_audio, settings).await,
             macos_hotkeys: if cfg!(target_os = "macos") {
-                settings.get_macos_hotkeys().await
+                Some(settings.get_macos_hotkeys().await)
             } else {
-                Vec::new()
+                None
             },
         },
         paths: Paths {
@@ -791,14 +791,17 @@ async fn get_daemon_status(
     status
 }
 
-async fn get_app_audio_status(app_audio: &AppAudio, settings: &SettingsHandle) -> MacosAppAudio {
+async fn get_app_audio_status(
+    app_audio: &AppAudio,
+    settings: &SettingsHandle,
+) -> Option<MacosAppAudio> {
     #[cfg(target_os = "macos")]
-    return crate::platform::macos::app_audio::app_audio_status(app_audio, settings).await;
+    return Some(crate::platform::macos::app_audio::app_audio_status(app_audio, settings).await);
 
     #[cfg(not(target_os = "macos"))]
     {
         let _ = (app_audio, settings);
-        MacosAppAudio::default()
+        None
     }
 }
 
@@ -849,17 +852,9 @@ fn hotkeys_changed(bindings: Vec<Binding>) {
 }
 
 fn send_app_levels(app_audio: &AppAudio, sender: oneshot::Sender<Result<HashMap<String, f32>>>) {
-    // Reading the levels asks coreaudiod, which can block, so keep it off this task.
+    // Answered from the bridge's cache, so this never waits on coreaudiod.
     #[cfg(target_os = "macos")]
-    {
-        let app_audio = app_audio.clone();
-        tokio::spawn(async move {
-            let levels = tokio::task::spawn_blocking(move || app_audio.take_levels())
-                .await
-                .unwrap_or_else(|error| Err(anyhow!(error.to_string())));
-            let _ = sender.send(levels);
-        });
-    }
+    let _ = sender.send(Ok(app_audio.levels()));
 
     #[cfg(not(target_os = "macos"))]
     {
@@ -1169,4 +1164,24 @@ async fn check_firmware_versions(x: FwSender, source: FirmwareSource) {
 
     debug!("Firmware Update Process Finished");
     let _ = x.send(map).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use goxlr_ipc::DaemonConfig;
+
+    #[test]
+    fn macos_only_config_is_null_elsewhere() {
+        let value = serde_json::to_value(DaemonConfig::default()).unwrap();
+        assert_eq!(value["macos_app_audio"], serde_json::Value::Null);
+        assert_eq!(value["macos_hotkeys"], serde_json::Value::Null);
+
+        // Older clients' configs without the fields still load.
+        let mut value = value;
+        let config = value.as_object_mut().unwrap();
+        config.remove("macos_app_audio");
+        config.remove("macos_hotkeys");
+        let config: DaemonConfig = serde_json::from_value(value).unwrap();
+        assert!(config.macos_app_audio.is_none() && config.macos_hotkeys.is_none());
+    }
 }

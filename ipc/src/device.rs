@@ -42,13 +42,15 @@ pub struct DaemonConfig {
     pub platform: String,
     pub handle_macos_aggregates: bool,
     pub macos_virtual_audio_routes: u32,
+    /// Per-app audio, `None` on other platforms.
     #[serde(default)]
-    pub macos_app_audio: MacosAppAudio,
+    pub macos_app_audio: Option<MacosAppAudio>,
+    /// Global keyboard shortcuts, `None` on other platforms.
     #[serde(default)]
-    pub macos_hotkeys: Vec<Binding>,
+    pub macos_hotkeys: Option<Vec<Binding>>,
 }
 
-/// Per-app audio on macOS, empty on other platforms.
+/// Per-app audio on macOS.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MacosAppAudio {
     /// The apps coreaudiod currently knows about.

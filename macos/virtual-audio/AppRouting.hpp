@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <sys/types.h>
@@ -36,10 +37,16 @@ constexpr uint32_t kMaxGain = 2000;
 // Boosted samples above this magnitude are softly saturated so they never pass 1.0.
 constexpr float kLimiterKnee = 0.8f;
 constexpr size_t kLevelSlots = 128;
-constexpr size_t kInjectionFrames = 4096;
-// A reader this far behind an injection history (e.g. after it stalled) skips ahead.
-constexpr uint64_t kMaxReaderLag = 1024;
+// A source may publish up to kMaxFrames in one cycle, so a reader keeping up can be that far
+// behind plus its own read. Only a reader further behind than that (e.g. after it stalled)
+// skips ahead.
+constexpr uint64_t kMaxReaderLag = kMaxFrames;
 constexpr uint64_t kResyncLag = 256;
+// Room for the largest allowed lag plus one more push from the writer while the reader reads,
+// so frames a reader may still need are never overwritten.
+constexpr size_t kInjectionFrames = 16384;
+static_assert(kInjectionFrames >= 3 * kMaxFrames, "injection history too small");
+static_assert((kInjectionFrames & (kInjectionFrames - 1)) == 0, "must be a power of two");
 
 struct Rule {
     pid_t pid = 0;
@@ -48,7 +55,8 @@ struct Rule {
 };
 
 // Parses "pid:route:gain;..." where route is 0-4 or '-' to keep the device the app chose, and
-// gain is per mille (0-2000). Returns nothing if any entry is malformed.
+// gain is per mille (0-2000). Returns nothing if any entry is malformed. Entries after the
+// first kMaxRules are ignored (the daemon never sends more).
 inline std::optional<std::vector<Rule>> parseRules(const std::string& text) {
     std::vector<Rule> rules;
     size_t start = 0;
@@ -84,43 +92,71 @@ inline std::optional<std::vector<Rule>> parseRules(const std::string& text) {
             return std::nullopt;
         }
 
-        if (rules.size() == kMaxRules) return std::nullopt;
-        rules.push_back({pid_t(pid), route, uint32_t(gain)});
+        if (rules.size() < kMaxRules) rules.push_back({pid_t(pid), route, uint32_t(gain)});
     }
     return rules;
 }
 
-// Fixed slots the IO threads scan without locks. An update may be seen half-applied for one
-// cycle, which at worst routes one buffer with an old rule.
+// Two tables of fixed slots the IO threads scan without locks or waiting. The writer fills the
+// table readers aren't directed to, then flips `active_`. Each table has a sequence number that
+// is odd while it's being written; a reader that sees it change during its scan (the writer
+// reused the table it was on, which takes two applies within one scan) retries on the table that
+// is active now. So a lookup sees either the rules before or after an apply, never a mix.
 class RuleTable {
 public:
+    // Not real-time safe.
     void apply(const std::vector<Rule>& rules) {
+        std::lock_guard lock(writer_);
+        const uint32_t next = active_.load(std::memory_order_relaxed) ^ 1;
+        Table& table = tables_[next];
+        const uint32_t sequence = table.sequence.load(std::memory_order_relaxed);
+        table.sequence.store(sequence + 1, std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_release);
         for (size_t i = 0; i < kMaxRules; ++i) {
             const uint64_t packed = i < rules.size() ? pack(rules[i]) : 0;
-            slots_[i].store(packed, std::memory_order_release);
+            table.slots[i].store(packed, std::memory_order_relaxed);
         }
+        table.sequence.store(sequence + 2, std::memory_order_release);
+        active_.store(next, std::memory_order_release);
     }
 
     bool lookup(pid_t pid, uint32_t& route, uint32_t& gain) const {
-        for (const auto& slot : slots_) {
-            const uint64_t packed = slot.load(std::memory_order_acquire);
-            if (packed == 0) return false;
-            if (pid_t(packed >> 32) == pid) {
-                route = uint32_t(packed >> 16) & 0xFF;
-                gain = uint32_t(packed) & 0xFFFF;
-                return true;
+        while (true) {
+            const Table& table = tables_[active_.load(std::memory_order_acquire)];
+            const uint32_t before = table.sequence.load(std::memory_order_acquire);
+            if (before & 1) continue;
+            uint64_t found = 0;
+            for (const auto& slot : table.slots) {
+                const uint64_t packed = slot.load(std::memory_order_relaxed);
+                if (packed == 0) break;
+                if (pid_t(packed >> 32) == pid) {
+                    found = packed;
+                    break;
+                }
             }
+            std::atomic_thread_fence(std::memory_order_acquire);
+            if (table.sequence.load(std::memory_order_relaxed) != before) continue;
+            if (found == 0) return false;
+            route = uint32_t(found >> 16) & 0xFF;
+            gain = uint32_t(found) & 0xFFFF;
+            return true;
         }
-        return false;
     }
 
 private:
+    struct Table {
+        std::atomic<uint32_t> sequence{0};
+        std::array<std::atomic<uint64_t>, kMaxRules> slots{};
+    };
+
     static uint64_t pack(const Rule& rule) {
         return (uint64_t(uint32_t(rule.pid)) << 32) | (uint64_t(rule.route & 0xFF) << 16) |
                uint64_t(rule.gain & 0xFFFF);
     }
 
-    std::array<std::atomic<uint64_t>, kMaxRules> slots_{};
+    std::array<Table, 2> tables_{};
+    std::atomic<uint32_t> active_{0};
+    std::mutex writer_;
 };
 
 // Identity up to the knee, then a tanh curve that approaches 1.0 without reaching past it.
@@ -293,7 +329,7 @@ public:
             StereoHistory::Cursor& cursor = cursors.fromRoute[source];
             const uint64_t published = history.publishedFrames();
             if (cursor.nextFrame >= published) continue;
-            if (published - cursor.nextFrame > kMaxReaderLag) {
+            if (published - cursor.nextFrame > kMaxReaderLag + frameCount) {
                 cursor.nextFrame = published - kResyncLag;
             }
             history.read(cursor, scratch, frameCount);

@@ -40,20 +40,24 @@ output is normally GoXLR System. Apps that play to another device are left
 alone.
 
 The rule table is a writable plug-in property (`gxap`, a string of
-`pid:route:gain` entries), parsed off the real-time thread into fixed atomic
-slots that the IO path scans without locks or allocation.
+`pid:route:gain` entries, at most 128; later entries are ignored), parsed off
+the real-time thread into one of two tables of fixed atomic slots. The writer
+fills the table the IO path isn't using and then flips to it, and each table
+carries a sequence number, so a lookup sees the old or the new rules, never a
+mix, without locks or allocation.
 
 ## Daemon
 
 - A process monitor on the bridge thread reads
   `kAudioHardwarePropertyProcessObjectList` and, per process, its PID, bundle
   ID, whether it is running output, and its output devices. Helper processes
-  (WebKit, Chrome, Electron) are mapped to their app through
-  `responsibility_get_pid_responsible_for_pid`, falling back to the parent
-  chain; names come from `NSRunningApplication`.
+  (WebKit, Chrome, Electron) are mapped to their app through the private
+  responsibility API (`responsibility_get_pid_responsible_for_pid`, looked up
+  at runtime); without it, or when it has no answer, a process counts as its
+  own app. Names come from `NSRunningApplication`.
 - Settings store rules per app bundle ID: target route (or none) and volume.
-  The monitor expands them to PIDs and writes `gxap` whenever the result
-  changes (and periodically, like the route mask, in case coreaudiod reloaded
+  The monitor expands them to PIDs (capped at the plug-in's 128 rules, with a
+  warning logged once) and writes `gxap` whenever the result changes (and periodically, like the route mask, in case coreaudiod reloaded
   the plug-in).
 - The latest app list and channel volumes are shared with the tray.
 
@@ -94,8 +98,8 @@ Adds muting, boost to 200 %, per-app level meters, hidden apps, a web UI
 - A new read-only plug-in property `gxlv` (`0x67786c76`) returns
   `pid:peak;...`, the peak sample level of each client on a visible playback
   device since the previous read, after gain, in per mille (clamped to 0-1000).
-  Reading resets the peaks. Clients with no audio since the last read are
-  omitted. The IO path records peaks in fixed atomic slots (claimed by PID
+  Reading resets the peaks, so only the daemon's bridge thread reads it.
+  Clients with no audio since the last read are omitted. The IO path records peaks in fixed atomic slots (claimed by PID
   with compare-and-swap), so it stays lock- and allocation-free.
 
 ### Daemon and IPC
@@ -110,7 +114,7 @@ A rule equal to `{ route: None, volume: 100, muted: false }` is removed.
 Settings also keep a list of hidden app bundle IDs. Existing settings files
 (with `volume` as a `u8` and no `muted`) keep loading.
 
-`DaemonConfig` gains `macos_app_audio`:
+`DaemonConfig` gains `macos_app_audio`, `null` on other platforms:
 
 ```json
 "macos_app_audio": {
@@ -136,7 +140,10 @@ New `DaemonCommand` variants:
 
 `DaemonRequest::GetMacOSAppLevels` answers with
 `DaemonResponse::MacOSAppLevels(HashMap<String, f32>)`, the peak level from 0
-to 1 per bundle ID. The web UI polls it like `GetMicLevel`.
+to 1 per bundle ID. The web UI polls it like `GetMicLevel`. The daemon answers
+from a cache without asking coreaudiod: while any client asked for levels in
+the last 2 seconds, the bridge thread reads `gxlv` every 50 ms and keeps each
+app's peak, halving every 100 ms, so several clients see the same peaks.
 
 ### Tray
 
@@ -154,7 +161,8 @@ These are configured in the web UI and registered with Carbon
 
 ### Hotkeys contract
 
-`DaemonConfig.macos_hotkeys` is a list of bindings:
+`DaemonConfig.macos_hotkeys` is a list of bindings (`null` on other
+platforms):
 
 ```json
 "macos_hotkeys": [
@@ -175,8 +183,9 @@ These are configured in the web UI and registered with Carbon
     per-app rule.
 - **Keys:** `code` is the web `KeyboardEvent.code` value (for example `KeyM`,
   `Digit1`, `F13`, `ArrowUp`, `Minus`). The daemon maps it to a macOS virtual
-  key code and ignores codes it doesn't know. At least one modifier is
-  required, except for F13–F19.
+  key code and ignores codes it doesn't know. A binding needs Command, Option
+  or Control; Shift only counts together with one of them. F13–F19 need no
+  modifier.
 - **Setting:** `DaemonCommand::SetMacOSHotkeys(Vec<Binding>)` replaces the
   list. The daemon persists it and re-registers the hotkeys immediately.
 - **Registration:** Carbon `RegisterEventHotKey` on the main thread, driven by
