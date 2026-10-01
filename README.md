@@ -41,10 +41,11 @@ remain as a fallback.
   audio units. The selection is saved and restored when the daemon starts.
 - A menubar menu with sliders for the GoXLR System, Game, Chat, and Music channels, and a list of
   the apps playing to a GoXLR output. Each app can be moved to another GoXLR output and given its
-  own volume; the choice is saved per app. The routing happens inside the driver, so it needs no
-  process taps or audio capture permission. It applies to apps that play to a GoXLR device, such
-  as the system default output. Apps can be muted or boosted up to 200 % (with a soft limiter),
-  and all sliders follow the scroll wheel.
+  own volume; the choice is saved per app. Apps already playing to their selected GoXLR output use
+  the driver's volume rule. Moving an app from another output uses a CoreAudio process tap and a
+  private aggregate device, which requires System Audio Recording permission for the bridge.
+  If a tap cannot start, the app keeps its original output. Apps can be muted or boosted up to
+  200 % (with a soft limiter), and all sliders follow the scroll wheel.
 - An **Apps** tab in the Utility with the same controls plus a level meter per app, rules for apps
   that aren't running, and hidden apps.
 - Global **keyboard shortcuts** (System tab) to raise, lower, or mute a GoXLR channel and to mute

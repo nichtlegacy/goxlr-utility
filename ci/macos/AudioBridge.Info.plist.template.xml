@@ -11,5 +11,7 @@
     <key>LSUIElement</key><true/>
     <key>NSMicrophoneUsageDescription</key>
     <string>GoXLR Audio Bridge captures the GoXLR microphone for the virtual Microphone device.</string>
+    <key>NSAudioCaptureUsageDescription</key>
+    <string>GoXLR Audio Bridge captures audio from apps assigned to a GoXLR playback channel.</string>
 </dict>
 </plist>

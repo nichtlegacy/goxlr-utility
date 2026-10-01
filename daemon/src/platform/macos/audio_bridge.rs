@@ -7,6 +7,7 @@ use coreaudio_sys::{AudioDeviceID, kAudioUnitProperty_StreamFormat};
 use goxlr_usb::PID_GOXLR_FULL;
 use log::{debug, info, warn};
 use rtrb::{Consumer, RingBuffer};
+use std::collections::HashMap;
 use std::sync::mpsc::{self as std_mpsc, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -16,12 +17,13 @@ use tokio::time;
 
 use crate::platform::macos::app_audio::{
     AppAudioHandle, AppAudioSnapshot, AudioApp, BridgeSignal, LEVEL_INTERVAL, ProcessWatch,
-    installed_app_name, list_audio_apps, rules_string, running_mixers,
+    installed_app_name, list_audio_apps, mark_recent, rules_string_with_taps, running_mixers,
 };
 use crate::platform::macos::core_audio::{
     get_device_id_for_uid, get_goxlr_devices, get_virtual_audio_app_rules,
     get_virtual_audio_routes, set_virtual_audio_app_rules, set_virtual_audio_routes,
 };
+use crate::platform::macos::process_tap::TapManager;
 use crate::settings::SettingsHandle;
 use crate::shutdown::Shutdown;
 
@@ -456,9 +458,12 @@ fn sync_app_rules(
     apps: &[AudioApp],
     routes: u32,
     applied: &mut Option<String>,
+    taps: &mut TapManager,
+    bridge_running: bool,
 ) -> Result<()> {
     let rules = handle.block_on(settings.get_macos_app_rules());
-    let value = rules_string(apps, &rules);
+    let tap_pids = taps.sync(apps, &rules, routes, bridge_running);
+    let value = rules_string_with_taps(apps, &rules, &tap_pids.active, &tap_pids.failed);
     // Keep the names of apps with rules, so the UI can list them while they aren't running.
     // Rules without a name yet (e.g. saved before names were kept) take the installed app's.
     let known = handle.block_on(settings.get_macos_app_names());
@@ -525,7 +530,9 @@ fn bridge_loop(
     // same object ids with the plug-in back at its defaults.
     let mut applied_routes: Option<u32> = None;
     let mut applied_app_rules: Option<String> = None;
+    let mut taps = TapManager::default();
     let mut apps: Vec<AudioApp> = Vec::new();
+    let mut last_played = HashMap::new();
     // Each start attempt creates and starts up to 19 AudioUnits, so back off while the
     // physical device keeps refusing to start (e.g. right after it was plugged back in).
     let mut failures = 0u32;
@@ -551,7 +558,10 @@ fn bridge_loop(
                         break;
                     }
                     match list_audio_apps() {
-                        Ok(list) => apps = list,
+                        Ok(list) => {
+                            apps = list;
+                            mark_recent(&mut apps, &mut last_played);
+                        }
                         Err(error) => debug!("Unable to list audio apps: {error}"),
                     }
                 }
@@ -563,6 +573,8 @@ fn bridge_loop(
                         &apps,
                         routes,
                         &mut applied_app_rules,
+                        &mut taps,
+                        active.is_some(),
                     )
                 {
                     report_error(&mut last_error, error.to_string());
@@ -575,7 +587,7 @@ fn bridge_loop(
             next_levels = Instant::now() + LEVEL_INTERVAL;
             // Without the plug-in there's nothing to read.
             if ids.is_some()
-                && let Err(error) = app_audio.sample_levels(&apps)
+                && let Err(error) = app_audio.sample_levels(&apps, taps.take_levels())
             {
                 debug!("Unable to read app levels: {error}");
             }
@@ -589,6 +601,7 @@ fn bridge_loop(
             Ok(ids) => ids,
             Err(error) => {
                 active = None;
+                taps.clear();
                 applied_routes = None;
                 report_error(&mut last_error, error.to_string());
                 continue;
@@ -596,6 +609,7 @@ fn bridge_loop(
         };
         if current_ids != ids {
             active = None;
+            taps.clear();
             applied_routes = None;
             ids = current_ids;
         }
@@ -608,6 +622,7 @@ fn bridge_loop(
         if applied_routes != Some(routes) || get_virtual_audio_routes().ok() != Some(routes) {
             if let Err(error) = set_virtual_audio_routes(routes) {
                 active = None;
+                taps.clear();
                 applied_routes = None;
                 report_error(&mut last_error, error.to_string());
                 continue;
@@ -617,7 +632,10 @@ fn bridge_loop(
         }
 
         match list_audio_apps() {
-            Ok(list) => apps = list,
+            Ok(list) => {
+                apps = list;
+                mark_recent(&mut apps, &mut last_played);
+            }
             Err(error) => debug!("Unable to list audio apps: {error}"),
         }
         if let Err(error) = sync_app_rules(
@@ -627,6 +645,8 @@ fn bridge_loop(
             &apps,
             routes,
             &mut applied_app_rules,
+            &mut taps,
+            active.is_some(),
         ) {
             report_error(&mut last_error, error.to_string());
         }
@@ -635,9 +655,11 @@ fn bridge_loop(
             .is_some_and(|bridge| bridge.routes != routes)
         {
             active = None;
+            taps.clear();
         }
         if routes == 0 {
             active = None;
+            taps.clear();
             continue;
         }
 
@@ -645,6 +667,7 @@ fn bridge_loop(
             Ok(devices) => devices,
             Err(error) => {
                 active = None;
+                taps.clear();
                 report_error(&mut last_error, error.to_string());
                 continue;
             }
@@ -655,6 +678,7 @@ fn bridge_loop(
             .collect();
         if full_devices.len() != 1 {
             active = None;
+            taps.clear();
             failures = 0;
             retry_at = None;
             if full_devices.len() > 1 {
@@ -667,6 +691,7 @@ fn bridge_loop(
             Ok(id) => id,
             Err(error) => {
                 active = None;
+                taps.clear();
                 report_error(&mut last_error, error.to_string());
                 continue;
             }
@@ -675,6 +700,7 @@ fn bridge_loop(
             bridge.physical_uid != *physical_uid || Some(bridge.physical_id) != physical_id
         }) {
             active = None;
+            taps.clear();
         }
         if active.is_none() {
             let Some(physical_id) = physical_id else {
@@ -690,6 +716,18 @@ fn bridge_loop(
                     last_error = None;
                     failures = 0;
                     retry_at = None;
+                    if let Err(error) = sync_app_rules(
+                        handle,
+                        settings,
+                        app_audio,
+                        &apps,
+                        routes,
+                        &mut applied_app_rules,
+                        &mut taps,
+                        true,
+                    ) {
+                        report_error(&mut last_error, error.to_string());
+                    }
                 }
                 Err(error) => {
                     report_error(&mut last_error, error.to_string());

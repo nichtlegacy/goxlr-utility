@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
@@ -50,6 +50,8 @@ pub struct AudioApp {
     pub name: String,
     pub pids: Vec<i32>,
     pub playing: bool,
+    /// Playing now or within the last RECENT_PLAYBACK, see `mark_recent`.
+    pub recent: bool,
     /// The GoXLR playback route the app itself plays to, if any.
     pub device_route: Option<usize>,
 }
@@ -270,12 +272,24 @@ impl AppAudioHandle {
         self.levels.lock().unwrap().wanted(Instant::now())
     }
 
-    /// Reads the plug-in's levels (which resets them) into the cache. Called on the bridge
-    /// thread, as it asks coreaudiod and can block.
-    pub(crate) fn sample_levels(&self, apps: &[AudioApp]) -> Result<()> {
-        let levels = levels_by_app(apps, &get_virtual_audio_app_levels()?);
+    /// Reads the plug-in and tap levels into the cache. Called on the bridge thread because
+    /// the plug-in read asks coreaudiod and can block.
+    pub(crate) fn sample_levels(
+        &self,
+        apps: &[AudioApp],
+        tapped: HashMap<String, f32>,
+    ) -> Result<()> {
+        let driver_levels = get_virtual_audio_app_levels();
+        let mut levels = driver_levels
+            .as_deref()
+            .map(|value| levels_by_app(apps, value))
+            .unwrap_or_default();
+        for (id, peak) in tapped {
+            let entry = levels.entry(id).or_default();
+            *entry = entry.max(peak);
+        }
         self.levels.lock().unwrap().record(levels, Instant::now());
-        Ok(())
+        driver_levels.map(|_| ())
     }
 }
 
@@ -293,6 +307,7 @@ pub async fn app_audio_status(
             bundle_id: app.bundle_id,
             name: app.name,
             playing: app.playing,
+            recent: app.recent,
             device_route: app.device_route,
         })
         .collect();
@@ -303,6 +318,22 @@ pub async fn app_audio_status(
         hidden: settings.get_macos_hidden_apps().await,
         routes: settings.get_macos_virtual_audio_routes().await,
         mixers: app_audio.snapshot().mixers,
+    }
+}
+
+/// How long an app stays listed after it last played.
+const RECENT_PLAYBACK: Duration = Duration::from_secs(10 * 60);
+
+/// Marks apps that are playing or played within RECENT_PLAYBACK, remembering when each app
+/// last played in `last_played`.
+pub fn mark_recent(apps: &mut [AudioApp], last_played: &mut HashMap<String, Instant>) {
+    let now = Instant::now();
+    last_played.retain(|_, at| now.duration_since(*at) < RECENT_PLAYBACK);
+    for app in apps {
+        if app.playing {
+            last_played.insert(app.bundle_id.clone(), now);
+        }
+        app.recent = app.playing || last_played.contains_key(&app.bundle_id);
     }
 }
 
@@ -338,7 +369,19 @@ fn playback_route_for_uid(uid: &str) -> Option<usize> {
 
 /// Builds the plug-in's rule table for every process of every app that has a rule, keeping the
 /// lowest `MAX_APP_RULES` PIDs.
+#[cfg(test)]
 pub fn rules_string(apps: &[AudioApp], rules: &HashMap<String, MacosAppRule>) -> String {
+    rules_string_with_taps(apps, rules, &HashSet::new(), &HashSet::new())
+}
+
+/// A tapped process is rendered by the bridge, so the plug-in must not redirect it a second
+/// time. On tap failure, preserve its native route and apply only the volume rule.
+pub(crate) fn rules_string_with_taps(
+    apps: &[AudioApp],
+    rules: &HashMap<String, MacosAppRule>,
+    tapped: &HashSet<i32>,
+    failed: &HashSet<i32>,
+) -> String {
     static WARNED: AtomicBool = AtomicBool::new(false);
 
     let mut entries = Vec::new();
@@ -359,7 +402,11 @@ pub fn rules_string(apps: &[AudioApp], rules: &HashMap<String, MacosAppRule>) ->
         entries.extend(
             app.pids
                 .iter()
-                .map(|pid| (*pid, format!("{pid}:{route}:{gain}"))),
+                .filter(|pid| !tapped.contains(pid))
+                .map(|pid| {
+                    let route = if failed.contains(pid) { "-" } else { &route };
+                    (*pid, format!("{pid}:{route}:{gain}"))
+                }),
         );
     }
     entries.sort();
@@ -656,11 +703,16 @@ pub fn list_audio_apps() -> Result<Vec<AudioApp>> {
                     name,
                     pids: vec![pid],
                     playing,
+                    recent: playing,
                     device_route,
                 });
             }
         }
     });
+    for app in &mut apps {
+        app.pids.sort_unstable();
+        app.pids.dedup();
+    }
     apps.sort_by_cached_key(|app| app.name.to_lowercase());
     Ok(apps)
 }
@@ -668,12 +720,13 @@ pub fn list_audio_apps() -> Result<Vec<AudioApp>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AudioApp, LevelCache, MAX_APP_RULES, app_bundle_info, levels_by_app, list_audio_apps,
-        outer_app_path, playback_route_for_uid, rules_string,
+        AudioApp, LevelCache, MAX_APP_RULES, RECENT_PLAYBACK, app_bundle_info, levels_by_app,
+        list_audio_apps, mark_recent, outer_app_path, playback_route_for_uid, rules_string,
+        rules_string_with_taps,
     };
     use crate::settings::MacosAppRule;
     use goxlr_ipc::{MacosAppAudio, MacosAudioApp};
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::time::{Duration, Instant};
 
     #[test]
@@ -713,12 +766,39 @@ mod tests {
         }
     }
 
+    #[test]
+    fn keeps_recently_playing_apps_listed() {
+        let mut last_played = HashMap::new();
+        let mut apps = vec![
+            app("com.spotify.client", vec![1]),
+            app("com.example.idle", vec![2]),
+        ];
+        apps[0].playing = true;
+        apps[1].playing = false;
+        mark_recent(&mut apps, &mut last_played);
+        assert!(apps[0].recent && !apps[1].recent);
+
+        // Spotify pauses; it stays listed because it played a moment ago.
+        apps[0].playing = false;
+        mark_recent(&mut apps, &mut last_played);
+        assert!(apps[0].recent && !apps[1].recent);
+
+        // Once RECENT_PLAYBACK has passed, it drops out like the idle app.
+        last_played.insert(
+            "com.spotify.client".into(),
+            Instant::now() - RECENT_PLAYBACK,
+        );
+        mark_recent(&mut apps, &mut last_played);
+        assert!(!apps[0].recent);
+    }
+
     fn app(bundle_id: &str, pids: Vec<i32>) -> AudioApp {
         AudioApp {
             bundle_id: bundle_id.into(),
             name: bundle_id.into(),
             pids,
             playing: true,
+            recent: false,
             device_route: Some(0),
         }
     }
@@ -767,6 +847,24 @@ mod tests {
             ("com.apple.Safari".to_string(), rule(None, 900, false)),
         ]);
         assert_eq!(rules_string(&apps, &rules), "12:-:2000;77:3:0;90:-:2000");
+    }
+
+    #[test]
+    fn tapped_apps_are_not_redirected_twice_and_failed_taps_keep_native_output() {
+        let apps = [
+            app("com.google.Chrome", vec![12]),
+            app("com.example.Player", vec![77]),
+            app("com.example.Other", vec![90]),
+        ];
+        let rules = HashMap::from([
+            ("com.google.Chrome".into(), rule(Some(3), 50, false)),
+            ("com.example.Player".into(), rule(Some(3), 45, false)),
+            ("com.example.Other".into(), rule(Some(3), 80, false)),
+        ]);
+        assert_eq!(
+            rules_string_with_taps(&apps, &rules, &HashSet::from([12]), &HashSet::from([77])),
+            "77:-:450;90:3:800"
+        );
     }
 
     #[test]
@@ -833,6 +931,7 @@ mod tests {
                 bundle_id: "com.spotify.client".into(),
                 name: "Spotify".into(),
                 playing: true,
+                recent: true,
                 device_route: Some(0),
             }],
             rules: HashMap::from([("com.spotify.client".to_string(), rule(Some(3), 100, false))]),
@@ -847,6 +946,7 @@ mod tests {
             value,
             serde_json::json!({
                 "apps": [{"bundle_id": "com.spotify.client", "name": "Spotify", "playing": true,
+                          "recent": true,
                           "device_route": 0}],
                 "rules": {"com.spotify.client": {"route": 3, "volume": 100, "muted": false}},
                 "names": {"com.spotify.client": "Spotify"},
@@ -862,7 +962,11 @@ mod tests {
         // None of the known mixers has to be running, but the lookup must not fail or report
         // apps that aren't in the list.
         for name in super::running_mixers() {
-            assert!(super::TAPPING_MIXERS.iter().any(|(_, known)| *known == name));
+            assert!(
+                super::TAPPING_MIXERS
+                    .iter()
+                    .any(|(_, known)| *known == name)
+            );
         }
     }
 

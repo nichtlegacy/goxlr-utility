@@ -690,7 +690,7 @@ pub async fn spawn_usb_handler(
         }
 
         if change_found {
-            let new_status = get_daemon_status(
+            let mut new_status = get_daemon_status(
                 &devices,
                 &settings,
                 &http_settings,
@@ -704,13 +704,16 @@ pub async fn spawn_usb_handler(
             .await;
 
             // Convert them to JSON..
+            new_status.revision = daemon_status.revision;
             let json_old = serde_json::to_value(&daemon_status).unwrap();
-            let json_new = serde_json::to_value(&new_status).unwrap();
+            let mut json_new = serde_json::to_value(&new_status).unwrap();
 
-            let patch = diff(&json_old, &json_new);
-
-            // Only send a patch if something has changed..
-            if !patch.0.is_empty() {
+            // Only send a patch if something has changed, and number it so a client can
+            // tell it apart from changes already contained in a status it just fetched.
+            if !diff(&json_old, &json_new).0.is_empty() {
+                new_status.revision += 1;
+                json_new["revision"] = new_status.revision.into();
+                let patch = diff(&json_old, &json_new);
                 let _ = broadcast_tx.send(PatchEvent { data: patch });
             }
 
@@ -734,6 +737,7 @@ async fn get_daemon_status(
     app_audio: &AppAudio,
 ) -> DaemonStatus {
     let mut status = DaemonStatus {
+        revision: 0,
         config: DaemonConfig {
             http_settings: http_settings.clone(),
             daemon_version: String::from(VERSION),

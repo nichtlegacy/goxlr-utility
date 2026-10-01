@@ -818,7 +818,7 @@ impl UtilityDelegate {
             .apps
             .iter()
             .filter(|app| {
-                ((app.playing && app.device_route.is_some())
+                ((app.recent && app.device_route.is_some())
                     || snapshot.rules.contains_key(&app.bundle_id))
                     && !snapshot.hidden.contains(&app.bundle_id)
             })

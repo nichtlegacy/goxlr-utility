@@ -17,6 +17,10 @@ use std::path::PathBuf;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DaemonStatus {
+    /// Bumped on every change. Each patch replaces it, so a client can drop a patch it
+    /// receives after a newer full status (e.g. one computed just before a reconnect).
+    #[serde(default)]
+    pub revision: u64,
     pub config: DaemonConfig,
     pub firmware: HashMap<String, FirmwareStatus>,
     pub mixers: HashMap<String, MixerStatus>,
@@ -73,6 +77,10 @@ pub struct MacosAudioApp {
     pub bundle_id: String,
     pub name: String,
     pub playing: bool,
+    /// Playing now, or played within the last few minutes, so apps with short sounds
+    /// (notifications) stay reachable while silent background clients stay out of the way.
+    #[serde(default)]
+    pub recent: bool,
     /// The GoXLR playback route (0 - 4) the app plays to itself, if any.
     pub device_route: Option<usize>,
 }

@@ -41,6 +41,11 @@ microphone access when macOS asks. The targeted `install-local.sh` and
 `uninstall-local.sh` scripts remain available for first-time driver-only tests;
 `install-local.sh` intentionally refuses to replace an existing driver.
 
+Moving an app from another output to a GoXLR playback device uses a CoreAudio
+process tap. Grant **System Audio Recording** access to GoXLR Audio Bridge when
+macOS asks. An app already on its selected GoXLR device uses the driver's volume
+rule without a tap. If tap creation fails, the app stays on its original output.
+
 The existing release `.pkg` still lacks the HAL driver and nested helper app.
 Use this local build path until that installer is updated. Existing legacy
 Aggregate devices can remain enabled in settings and appear alongside the new
