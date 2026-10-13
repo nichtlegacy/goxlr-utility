@@ -94,6 +94,9 @@ pub async fn spawn_http_server(
             .service(upload_firmware)
             .default_service(web::to(default))
     })
+    // The daemon owns shutdown. Left on, actix stops only the HTTP server on SIGTERM/SIGQUIT
+    // and leaves a daemon the UI can no longer reach.
+    .disable_signals()
     .bind((settings.bind_address.clone(), settings.port));
 
     if let Err(e) = server {

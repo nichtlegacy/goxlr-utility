@@ -35,6 +35,10 @@ pub async fn run(
     app_audio: AppAudioHandle,
     mut stop: Shutdown,
 ) -> Result<()> {
+    // Register before anything else: once tokio (or actix) hooks SIGTERM, the default action
+    // is gone, so an unhandled TERM would leave the daemon running without doing anything.
+    let mut stream = signal(SignalKind::terminate())?;
+
     let bridge_stop = stop.clone();
     let bridge = tokio::spawn(async move {
         if let Err(error) = audio_bridge::run(settings, app_audio, bridge_stop).await {
@@ -56,15 +60,19 @@ pub async fn run(
     .await;
 
     if !HANDLE_MACOS_AGGREGATES.lock().unwrap().unwrap() {
+        select! {
+            Some(_) = stream.recv() => {
+                debug!("TERM Signal Received, Triggering STOP");
+                let _ = tx.send(EventTriggers::Stop(false)).await;
+            },
+            _ = stop.recv() => {}
+        }
         let _ = bridge.await;
         return Ok(());
     }
 
     // Ticker to monitor for device changes..
     let mut ticker = time::interval(Duration::from_secs(2));
-
-    // Shutdown Handlers..
-    let mut stream = signal(SignalKind::terminate())?;
 
     // A list of devices, and a list of their associated AudioDeviceIDs..
     let mut device_map: HashMap<String, Vec<AudioDeviceID>> = HashMap::new();
