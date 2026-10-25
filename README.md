@@ -48,6 +48,11 @@ remain as a fallback.
   200 % (with a soft limiter), and all sliders follow the scroll wheel.
 - An **Apps** tab in the Utility with the same controls plus a level meter per app, rules for apps
   that aren't running, and hidden apps.
+- An **Extra Microphone** menubar submenu that forwards an input outside the GoXLR, such as a USB
+  headset's microphone, into a GoXLR playback channel (Sample by default) with its own volume. The
+  bridge resamples it to 48 kHz and follows the device's clock. Route that channel to Chat Mic and
+  Broadcast (and away from Headphones) in the GoXLR's routing to add it to the microphone mixes. It
+  doesn't pass through the GoXLR's microphone effects.
 - Global **keyboard shortcuts** (System tab) to raise, lower, or mute a GoXLR channel and to mute
   the frontmost app. They use Carbon hotkeys, so no Accessibility permission is needed.
 
