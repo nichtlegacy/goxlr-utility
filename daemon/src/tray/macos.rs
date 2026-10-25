@@ -36,7 +36,7 @@ use tokio::sync::mpsc::{Receiver, Sender, channel};
 use tokio::sync::oneshot;
 use tokio::time::{Instant, sleep_until};
 
-use goxlr_ipc::{DaemonCommand, GoXLRCommand, HotkeyAction, PathTypes};
+use goxlr_ipc::{DaemonCommand, GoXLRCommand, HotkeyAction, MacosMicForward, PathTypes};
 use goxlr_types::ChannelName;
 
 use crate::ICON_MAC;
@@ -61,6 +61,9 @@ const PLAYBACK_CHANNELS: [ChannelName; 5] = [
 
 // App route items are tagged `app index * APP_TAG_STRIDE + route + 1`, 0 being the app's own output.
 const APP_TAG_STRIDE: usize = 8;
+
+// A forwarded microphone plays into Sample unless chosen otherwise.
+const MIC_DEFAULT_ROUTE: usize = 4;
 
 // Per-app volumes run up to 200 %.
 const APP_VOLUME_MAX: f64 = 200.;
@@ -90,6 +93,10 @@ struct PendingChanges {
     app_routes: HashMap<String, Option<usize>>,
     app_volumes: HashMap<String, u16>,
     app_mutes: HashMap<String, bool>,
+    // `Some(None)` stops forwarding the microphone.
+    mic_device: Option<Option<String>>,
+    mic_route: Option<usize>,
+    mic_volume: Option<u16>,
 }
 
 // Shared by the AppKit main thread and the tray task. The main thread only ever holds these
@@ -332,9 +339,31 @@ async fn apply_changes(p: &RunParams) -> (bool, bool) {
         settings.set_macos_app_rule(bundle_id.clone(), rule).await;
         p.link.app_audio.rule_changed(bundle_id.clone(), rule);
     }
+
+    let mic_toggled = changes.mic_device.is_some() || changes.mic_route.is_some();
+    if mic_toggled || changes.mic_volume.is_some() {
+        let current = settings.get_macos_mic_forward().await;
+        let mut forward = match changes.mic_device {
+            Some(None) => None,
+            Some(Some(uid)) => Some(MacosMicForward {
+                uid,
+                route: current.as_ref().map_or(MIC_DEFAULT_ROUTE, |f| f.route),
+                volume: current.as_ref().map_or(100, |f| f.volume),
+            }),
+            None => current,
+        };
+        if let Some(forward) = forward.as_mut() {
+            forward.route = changes.mic_route.unwrap_or(forward.route);
+            forward.volume = changes.mic_volume.unwrap_or(forward.volume);
+        }
+        settings.set_macos_mic_forward(forward).await;
+        p.link
+            .app_audio
+            .mic_forward_changed(settings.get_macos_mic_forward().await);
+    }
     (
-        !changes.app_routes.is_empty() || !changes.app_mutes.is_empty(),
-        !changes.app_volumes.is_empty(),
+        !changes.app_routes.is_empty() || !changes.app_mutes.is_empty() || mic_toggled,
+        !changes.app_volumes.is_empty() || changes.mic_volume.is_some(),
     )
 }
 
@@ -614,6 +643,8 @@ pub(crate) struct State {
     link: Arc<TrayLink>,
     // The bundle IDs of the apps in the open menu, indexed by the app items' tags.
     menu_apps: RefCell<Vec<String>>,
+    // The UIDs of the inputs in the open menu, indexed by the input items' tags minus one.
+    menu_inputs: RefCell<Vec<String>>,
 }
 
 define_class! {
@@ -689,6 +720,36 @@ define_class! {
             let muted = item.state() != NSControlStateValueOn;
             let link = &self.ivars().link;
             link.pending.lock().unwrap().app_mutes.insert(bundle_id, muted);
+            link.changed.notify_one();
+        }
+
+        #[unsafe(method(micDevice:))]
+        fn mic_device(&self, item: &NSMenuItem) {
+            // Tag 0 is "Off", the inputs follow from 1.
+            let device = match (item.tag() as usize).checked_sub(1) {
+                None => None,
+                Some(index) => match self.ivars().menu_inputs.borrow().get(index) {
+                    Some(uid) => Some(uid.clone()),
+                    None => return,
+                },
+            };
+            let link = &self.ivars().link;
+            link.pending.lock().unwrap().mic_device = Some(device);
+            link.changed.notify_one();
+        }
+
+        #[unsafe(method(micRoute:))]
+        fn mic_route(&self, item: &NSMenuItem) {
+            let link = &self.ivars().link;
+            link.pending.lock().unwrap().mic_route = Some(item.tag() as usize);
+            link.changed.notify_one();
+        }
+
+        #[unsafe(method(micVolume:))]
+        fn mic_volume(&self, slider: &ScrollSlider) {
+            slider.update_label();
+            let link = &self.ivars().link;
+            link.pending.lock().unwrap().mic_volume = Some(slider.doubleValue().round() as u16);
             link.changed.notify_one();
         }
 
@@ -771,6 +832,7 @@ impl UtilityDelegate {
             shutdown_signal,
             link,
             menu_apps: RefCell::default(),
+            menu_inputs: RefCell::default(),
         });
 
         unsafe { msg_send![super(delegate), init] }
@@ -892,7 +954,84 @@ impl UtilityDelegate {
             apps.iter().map(|app| app.bundle_id.clone()).collect();
 
         menu.addItem(&App::get_separator(mtm));
+        self.add_mic_items(menu);
+        menu.addItem(&App::get_separator(mtm));
         App::add_static_items(mtm, menu);
+    }
+
+    // A submenu to forward a microphone outside the GoXLR into one of its playback channels.
+    fn add_mic_items(&self, menu: &NSMenu) {
+        let mtm = self.mtm();
+        let mic = self.ivars().link.app_audio.mic();
+        let forward = mic.forward.as_ref();
+        let submenu = NSMenu::new(mtm);
+
+        let choices = once(None).chain(mic.inputs.iter().map(Some));
+        for (tag, input) in choices.enumerate() {
+            let item = NSMenuItem::new(mtm);
+            item.setTitle(&NSString::from_str(
+                input.map_or("Off", |input| &input.name),
+            ));
+            unsafe {
+                item.setTarget(Some(self.as_ref()));
+                item.setAction(Some(sel!(micDevice:)));
+            }
+            item.setTag(tag as isize);
+            if input.map(|input| &input.uid) == forward.map(|forward| &forward.uid) {
+                item.setState(NSControlStateValueOn);
+            }
+            submenu.addItem(&item);
+        }
+        // Keep a forwarded device listed while it's disconnected, so it can be turned off.
+        let missing = forward.filter(|f| !mic.inputs.iter().any(|input| input.uid == f.uid));
+        if missing.is_some() {
+            submenu.addItem(&App::get_header(mtm, "Selected device not connected"));
+        }
+
+        if let Some(forward) = forward {
+            submenu.addItem(&App::get_separator(mtm));
+            submenu.addItem(&App::get_header(mtm, "Play into"));
+            for (route, name) in PLAYBACK_NAMES.iter().enumerate() {
+                let item = NSMenuItem::new(mtm);
+                item.setTitle(&NSString::from_str(name));
+                unsafe {
+                    item.setTarget(Some(self.as_ref()));
+                    item.setAction(Some(sel!(micRoute:)));
+                }
+                item.setTag(route as isize);
+                if route == forward.route {
+                    item.setState(NSControlStateValueOn);
+                }
+                submenu.addItem(&item);
+            }
+            submenu.addItem(&App::get_separator(mtm));
+            submenu.addItem(&self.slider_item(
+                None,
+                forward.volume.into(),
+                APP_VOLUME_MAX,
+                sel!(micVolume:),
+                0,
+            ));
+        }
+        *self.ivars().menu_inputs.borrow_mut() =
+            mic.inputs.iter().map(|input| input.uid.clone()).collect();
+
+        let title = match forward {
+            Some(forward) => {
+                let name = mic
+                    .inputs
+                    .iter()
+                    .find(|input| input.uid == forward.uid)
+                    .map_or("not connected", |input| &input.name);
+                let route = PLAYBACK_NAMES.get(forward.route).unwrap_or(&"?");
+                format!("Extra Microphone — {name} → {route}")
+            }
+            None => "Extra Microphone — Off".to_string(),
+        };
+        let item = NSMenuItem::new(mtm);
+        item.setTitle(&NSString::from_str(&title));
+        item.setSubmenu(Some(&submenu));
+        menu.addItem(&item);
     }
 
     // A menu row holding a label and a continuous slider which sends `action` to us. Without a

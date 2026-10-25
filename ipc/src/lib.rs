@@ -144,6 +144,9 @@ pub enum DaemonCommand {
     RemoveMacOSAppRule(String),
     SetMacOSAppHidden(String, bool),
 
+    // Forwards a microphone outside the GoXLR into a playback route, `None` stops it.
+    SetMacOSMicForward(Option<MacosMicForward>),
+
     // Replaces the global hotkeys, which are only registered on macOS.
     SetMacOSHotkeys(Vec<Binding>),
 }

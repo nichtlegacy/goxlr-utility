@@ -70,6 +70,30 @@ pub struct MacosAppAudio {
     /// process, so rules here don't reach the apps they control.
     #[serde(default)]
     pub mixers: Vec<String>,
+    /// Inputs outside the GoXLR that the bridge can forward.
+    #[serde(default)]
+    pub inputs: Vec<MacosInputDevice>,
+    #[serde(default)]
+    pub mic_forward: Option<MacosMicForward>,
+}
+
+/// A CoreAudio input device that isn't part of the GoXLR.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MacosInputDevice {
+    pub uid: String,
+    pub name: String,
+}
+
+/// A microphone outside the GoXLR (a USB headset, say) that the macOS bridge plays into a
+/// GoXLR playback route, so the GoXLR's routing can add it to the Chat Mic and Broadcast mixes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MacosMicForward {
+    /// The CoreAudio UID of the input device.
+    pub uid: String,
+    /// The playback route (System, Game, Chat, Music, Sample) it plays into.
+    pub route: usize,
+    /// Percent, from 0 to 200.
+    pub volume: u16,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

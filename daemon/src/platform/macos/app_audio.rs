@@ -20,7 +20,7 @@ use coreaudio_sys::{
     kAudioObjectPropertyScopeOutput, kAudioObjectSystemObject, kAudioProcessPropertyBundleID,
     kAudioProcessPropertyDevices, kAudioProcessPropertyIsRunningOutput, kAudioProcessPropertyPID,
 };
-use goxlr_ipc::{MacosAppAudio, MacosAudioApp};
+use goxlr_ipc::{MacosAppAudio, MacosAudioApp, MacosInputDevice, MacosMicForward};
 use log::warn;
 use objc2::rc::autoreleasepool;
 use objc2_app_kit::NSRunningApplication;
@@ -215,6 +215,14 @@ pub struct AppAudioHandle {
     // Wakes the primary worker to refresh the daemon status when the snapshot changes.
     changed: Arc<Notify>,
     levels: Arc<Mutex<LevelCache>>,
+    mic: Arc<Mutex<MicState>>,
+}
+
+/// The inputs the bridge can forward, and the forward from the settings, for the tray menu.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MicState {
+    pub inputs: Vec<MacosInputDevice>,
+    pub forward: Option<MacosMicForward>,
 }
 
 impl AppAudioHandle {
@@ -243,6 +251,28 @@ impl AppAudioHandle {
     /// Mirrors a rule that was just stored in the settings and wakes the bridge to apply it.
     pub fn rule_changed(&self, bundle_id: String, rule: MacosAppRule) {
         apply_app_rule(&mut self.snapshot.lock().unwrap().rules, bundle_id, rule);
+        self.changed.notify_one();
+        if let Some(bridge) = self.bridge.lock().unwrap().as_ref() {
+            let _ = bridge.send(BridgeSignal::Refresh);
+        }
+    }
+
+    pub fn mic(&self) -> MicState {
+        self.mic.lock().unwrap().clone()
+    }
+
+    pub(crate) fn publish_mic(&self, state: MicState) {
+        let mut current = self.mic.lock().unwrap();
+        if *current != state {
+            *current = state;
+            self.changed.notify_one();
+        }
+    }
+
+    /// Mirrors a microphone forward that was just stored in the settings and wakes the bridge
+    /// to apply its volume (it picks up a new device or route on its next tick).
+    pub fn mic_forward_changed(&self, forward: Option<MacosMicForward>) {
+        self.mic.lock().unwrap().forward = forward;
         self.changed.notify_one();
         if let Some(bridge) = self.bridge.lock().unwrap().as_ref() {
             let _ = bridge.send(BridgeSignal::Refresh);
@@ -318,6 +348,8 @@ pub async fn app_audio_status(
         hidden: settings.get_macos_hidden_apps().await,
         routes: settings.get_macos_virtual_audio_routes().await,
         mixers: app_audio.snapshot().mixers,
+        inputs: app_audio.mic().inputs,
+        mic_forward: settings.get_macos_mic_forward().await,
     }
 }
 
@@ -725,7 +757,7 @@ mod tests {
         rules_string_with_taps,
     };
     use crate::settings::MacosAppRule;
-    use goxlr_ipc::{MacosAppAudio, MacosAudioApp};
+    use goxlr_ipc::{MacosAppAudio, MacosAudioApp, MacosInputDevice, MacosMicForward};
     use std::collections::{HashMap, HashSet};
     use std::time::{Duration, Instant};
 
@@ -939,6 +971,15 @@ mod tests {
             hidden: vec!["com.apple.siri".into()],
             routes: 61442,
             mixers: vec!["FineTune".into()],
+            inputs: vec![MacosInputDevice {
+                uid: "AppleUSBAudioEngine:Astro:A50".into(),
+                name: "Astro A50 Voice".into(),
+            }],
+            mic_forward: Some(MacosMicForward {
+                uid: "AppleUSBAudioEngine:Astro:A50".into(),
+                route: 4,
+                volume: 100,
+            }),
         };
         let value = serde_json::to_value(&status).unwrap();
         println!("{value}");
@@ -952,7 +993,9 @@ mod tests {
                 "names": {"com.spotify.client": "Spotify"},
                 "hidden": ["com.apple.siri"],
                 "routes": 61442,
-                "mixers": ["FineTune"]
+                "mixers": ["FineTune"],
+                "inputs": [{"uid": "AppleUSBAudioEngine:Astro:A50", "name": "Astro A50 Voice"}],
+                "mic_forward": {"uid": "AppleUSBAudioEngine:Astro:A50", "route": 4, "volume": 100}
             })
         );
     }

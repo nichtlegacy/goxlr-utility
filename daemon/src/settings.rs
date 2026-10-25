@@ -5,7 +5,7 @@ use directories::ProjectDirs;
 pub use goxlr_ipc::MacosAppRule;
 use goxlr_ipc::{
     Binding, FirmwareSource, GoXLRCommand, LogLevel, MACOS_ALL_VIRTUAL_AUDIO_ROUTES,
-    MACOS_DEFAULT_VIRTUAL_AUDIO_ROUTES,
+    MACOS_DEFAULT_VIRTUAL_AUDIO_ROUTES, MacosMicForward,
 };
 use goxlr_types::VodMode;
 use goxlr_types::VodMode::Routable;
@@ -70,6 +70,7 @@ impl SettingsHandle {
                 macos_app_rules: None,
                 macos_app_names: None,
                 macos_hidden_apps: None,
+                macos_mic_forward: None,
                 macos_hotkeys: Vec::new(),
                 profile_directory: None,
                 mic_profile_directory: None,
@@ -323,6 +324,20 @@ impl SettingsHandle {
             list.push(bundle_id);
             list.sort();
         }
+    }
+
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub async fn get_macos_mic_forward(&self) -> Option<MacosMicForward> {
+        let settings = self.settings.read().await;
+        settings.macos_mic_forward.clone()
+    }
+
+    pub async fn set_macos_mic_forward(&self, forward: Option<MacosMicForward>) {
+        let mut settings = self.settings.write().await;
+        settings.macos_mic_forward = forward.map(|mut forward| {
+            forward.volume = forward.volume.min(200);
+            forward
+        });
     }
 
     pub async fn get_macos_hotkeys(&self) -> Vec<Binding> {
@@ -799,6 +814,7 @@ pub struct Settings {
     macos_app_rules: Option<HashMap<String, MacosAppRule>>,
     macos_app_names: Option<HashMap<String, String>>,
     macos_hidden_apps: Option<Vec<String>>,
+    macos_mic_forward: Option<MacosMicForward>,
     #[serde(default)]
     macos_hotkeys: Vec<Binding>,
     profile_directory: Option<PathBuf>,

@@ -8,6 +8,8 @@ use goxlr_usb::PID_GOXLR_FULL;
 use log::{debug, info, warn};
 use rtrb::{Consumer, RingBuffer};
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{self as std_mpsc, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -16,17 +18,21 @@ use tokio::sync::oneshot;
 use tokio::time;
 
 use crate::platform::macos::app_audio::{
-    AppAudioHandle, AppAudioSnapshot, AudioApp, BridgeSignal, LEVEL_INTERVAL, ProcessWatch,
-    installed_app_name, list_audio_apps, mark_recent, rules_string_with_taps, running_mixers,
+    AppAudioHandle, AppAudioSnapshot, AudioApp, BridgeSignal, LEVEL_INTERVAL, MicState,
+    PLAYBACK_NAMES, ProcessWatch, installed_app_name, list_audio_apps, mark_recent,
+    rules_string_with_taps, running_mixers,
 };
 use crate::platform::macos::core_audio::{
-    get_device_id_for_uid, get_goxlr_devices, get_virtual_audio_app_rules,
-    get_virtual_audio_routes, set_virtual_audio_app_rules, set_virtual_audio_routes,
+    InputDevice, get_device_id_for_uid, get_goxlr_devices, get_virtual_audio_app_rules,
+    get_virtual_audio_routes, list_input_devices, set_virtual_audio_app_rules,
+    set_virtual_audio_routes,
 };
 use crate::platform::macos::process_tap::TapManager;
 use crate::settings::SettingsHandle;
 use crate::shutdown::Shutdown;
+use goxlr_ipc::{MacosInputDevice, MacosMicForward};
 
+const SAMPLE_RATE: f64 = 48_000.0;
 const RING_FRAMES: usize = 2048;
 const INPUT_CHANNELS: usize = 23;
 const OUTPUT_CHANNELS: usize = 10;
@@ -145,22 +151,23 @@ struct VirtualIds {
 type Stereo = [f32; 2];
 type AudioArgs = render_callback::Args<data::Interleaved<f32>>;
 
-fn stream_format(channels: usize) -> StreamFormat {
+fn stream_format(channels: usize, sample_rate: f64) -> StreamFormat {
     StreamFormat {
-        sample_rate: 48_000.0,
+        sample_rate,
         sample_format: SampleFormat::F32,
         flags: LinearPcmFlags::IS_FLOAT | LinearPcmFlags::IS_PACKED,
         channels: channels as u32,
     }
 }
 
-fn input_unit(id: AudioDeviceID, channels: usize) -> Result<AudioUnit> {
+// The HAL unit doesn't convert the sample rate of an input, so `sample_rate` must be the device's.
+fn input_unit(id: AudioDeviceID, channels: usize, sample_rate: f64) -> Result<AudioUnit> {
     let mut unit = audio_unit_from_device_id(id, true)?;
     unit.set_property(
         kAudioUnitProperty_StreamFormat,
         Scope::Output,
         Element::Input,
-        Some(&stream_format(channels).to_asbd()),
+        Some(&stream_format(channels, sample_rate).to_asbd()),
     )?;
     Ok(unit)
 }
@@ -171,7 +178,7 @@ fn output_unit(id: AudioDeviceID, channels: usize) -> Result<AudioUnit> {
         kAudioUnitProperty_StreamFormat,
         Scope::Input,
         Element::Output,
-        Some(&stream_format(channels).to_asbd()),
+        Some(&stream_format(channels, SAMPLE_RATE).to_asbd()),
     )?;
     Ok(unit)
 }
@@ -194,22 +201,29 @@ fn set_pair(frame: &mut [f32], left: usize, pair: Stereo) {
 
 // The GoXLR and virtual devices have independent clocks. Keep a small backlog
 // and interpolate at a slightly adjusted rate instead of periodically losing a
-// whole audio block when their clocks drift apart.
+// whole audio block when their clocks drift apart. A source at another sample rate advances by
+// `step` source frames per output frame.
 struct StereoReader {
     queue: Consumer<Stereo>,
     current: Stereo,
     next: Stereo,
     phase: f32,
+    step: f32,
     started: bool,
 }
 
 impl StereoReader {
     fn new(queue: Consumer<Stereo>) -> Self {
+        Self::with_step(queue, 1.0)
+    }
+
+    fn with_step(queue: Consumer<Stereo>, step: f32) -> Self {
         Self {
             queue,
             current: [0.0; 2],
             next: [0.0; 2],
             phase: 0.0,
+            step,
             started: false,
         }
     }
@@ -227,7 +241,8 @@ impl StereoReader {
         }
 
         let backlog = self.queue.slots() as f32;
-        let rate = (1.0 + (backlog - TARGET as f32) / TARGET as f32 * 0.002).clamp(0.998, 1.002);
+        let rate = self.step
+            * (1.0 + (backlog - TARGET as f32) / TARGET as f32 * 0.002).clamp(0.998, 1.002);
         let mut frames = output.chunks_exact_mut(channels);
         while let Some(frame) = frames.next() {
             frame[0] = self.current[0] + (self.next[0] - self.current[0]) * self.phase;
@@ -254,10 +269,49 @@ impl StereoReader {
     }
 }
 
+/// A microphone outside the GoXLR, and the playback route it's played into.
+#[derive(Debug, Clone, PartialEq)]
+struct MicSource {
+    device: InputDevice,
+    route: usize,
+}
+
+fn mic_gain_bits(volume: u16) -> u32 {
+    (f32::from(volume.min(200)) / 100.0).to_bits()
+}
+
+// Opens the microphone and queues its audio as stereo frames, read back at the GoXLR's rate.
+fn mic_unit(mic: &MicSource) -> Result<(AudioUnit, StereoReader)> {
+    let channels = mic.device.channels;
+    let (mut producer, consumer) = RingBuffer::<Stereo>::new(RING_FRAMES);
+    let mut unit = input_unit(mic.device.id, channels, mic.device.sample_rate)?;
+    unit.set_input_callback(move |args: AudioArgs| {
+        for frame in args
+            .data
+            .buffer
+            .chunks_exact(channels)
+            .take(args.num_frames)
+        {
+            // Headset microphones are mono, mix a stereo input down so both sides count.
+            let sample = if channels > 1 {
+                (frame[0] + frame[1]) * 0.5
+            } else {
+                frame[0]
+            };
+            let _ = producer.push([sample; 2]);
+        }
+        Ok(())
+    })?;
+    let step = (mic.device.sample_rate / SAMPLE_RATE) as f32;
+    Ok((unit, StereoReader::with_step(consumer, step)))
+}
+
 struct Bridge {
     physical_uid: String,
     physical_id: AudioDeviceID,
     routes: u32,
+    // The microphone being forwarded, `None` if none was asked for or it failed to open.
+    mic: Option<MicSource>,
     units: Vec<AudioUnit>,
 }
 
@@ -267,8 +321,10 @@ impl Bridge {
         physical: AudioDeviceID,
         virtual_ids: VirtualIds,
         routes: u32,
+        mic: Option<&MicSource>,
+        mic_gain: Arc<AtomicU32>,
     ) -> Result<Self> {
-        let mut physical_input = input_unit(physical, INPUT_CHANNELS)?;
+        let mut physical_input = input_unit(physical, INPUT_CHANNELS, SAMPLE_RATE)?;
         let mut physical_output = output_unit(physical, OUTPUT_CHANNELS)?;
 
         let mut capture_producers = Vec::with_capacity(CAPTURE_COUNT);
@@ -313,7 +369,7 @@ impl Bridge {
                 continue;
             }
             let (mut producer, consumer) = RingBuffer::<Stereo>::new(RING_FRAMES);
-            let mut unit = input_unit(id, 2)?;
+            let mut unit = input_unit(id, 2, SAMPLE_RATE)?;
             unit.set_input_callback(move |args: AudioArgs| {
                 for frame in args.data.buffer.chunks_exact(2).take(args.num_frames) {
                     let _ = producer.push([frame[0], frame[1]]);
@@ -324,7 +380,21 @@ impl Bridge {
             playback_units.push(unit);
         }
 
+        // A microphone that fails to open shouldn't take the GoXLR's own audio down with it.
+        let (mic_unit, mut mic_reader, mic) = match mic.map(|mic| (mic, mic_unit(mic))) {
+            Some((mic, Ok((unit, reader)))) => (Some(unit), Some(reader), Some(mic.clone())),
+            Some((mic, Err(error))) => {
+                warn!("Unable to forward {}: {error}", mic.device.name);
+                (None, None, None)
+            }
+            None => (None, None, None),
+        };
+        let mic_left = mic
+            .as_ref()
+            .map_or(0, |mic| PLAYBACK_ROUTES[mic.route].physical_channel);
+
         let mut output_blocks = Box::new([[0.0f32; 1024]; PLAYBACK_COUNT]);
+        let mut mic_block = Box::new([0.0f32; 1024]);
         physical_output.set_render_callback(move |args: AudioArgs| {
             args.data.buffer.fill(0.0);
             // Process arbitrary callback sizes without allocating on the audio thread.
@@ -344,6 +414,14 @@ impl Bridge {
                         );
                     }
                 }
+                if let Some(reader) = &mut mic_reader {
+                    reader.fill(&mut mic_block[..frames * 2], 2);
+                    let gain = f32::from_bits(mic_gain.load(Ordering::Relaxed));
+                    for (index, frame) in chunk.chunks_exact_mut(OUTPUT_CHANNELS).enumerate() {
+                        frame[mic_left] += mic_block[index * 2] * gain;
+                        frame[mic_left + 1] += mic_block[index * 2 + 1] * gain;
+                    }
+                }
             }
             Ok(())
         })?;
@@ -352,11 +430,13 @@ impl Bridge {
         units.push(physical_input);
         units.extend(capture_units);
         units.extend(playback_units);
+        units.extend(mic_unit);
         units.push(physical_output);
         let mut bridge = Self {
             physical_uid,
             physical_id: physical,
             routes,
+            mic,
             units: Vec::with_capacity(units.len()),
         };
         for mut unit in units {
@@ -516,6 +596,39 @@ fn debounce_apps_changed(signals: &std_mpsc::Receiver<BridgeSignal>) -> bool {
     }
 }
 
+// Lists the inputs for the tray and status, applies the forward's volume, and returns the
+// microphone to forward if its device is connected.
+fn resolve_mic(
+    handle: &Handle,
+    settings: &SettingsHandle,
+    app_audio: &AppAudioHandle,
+    mic_gain: &AtomicU32,
+) -> Option<MicSource> {
+    let forward = handle.block_on(settings.get_macos_mic_forward());
+    if let Some(forward) = &forward {
+        mic_gain.store(mic_gain_bits(forward.volume), Ordering::Relaxed);
+    }
+    let inputs = list_input_devices()
+        .map_err(|error| debug!("Unable to list input devices: {error}"))
+        .unwrap_or_default();
+    app_audio.publish_mic(MicState {
+        inputs: inputs
+            .iter()
+            .map(|device| MacosInputDevice {
+                uid: device.uid.clone(),
+                name: device.name.clone(),
+            })
+            .collect(),
+        forward: forward.clone(),
+    });
+    let MacosMicForward { uid, route, .. } = forward?;
+    if route >= PLAYBACK_COUNT {
+        return None;
+    }
+    let device = inputs.into_iter().find(|device| device.uid == uid)?;
+    Some(MicSource { device, route })
+}
+
 fn bridge_loop(
     handle: &Handle,
     settings: &SettingsHandle,
@@ -531,6 +644,10 @@ fn bridge_loop(
     let mut applied_routes: Option<u32> = None;
     let mut applied_app_rules: Option<String> = None;
     let mut taps = TapManager::default();
+    // Read by the output callback, so volume changes apply without restarting the bridge.
+    let mic_gain = Arc::new(AtomicU32::new(mic_gain_bits(100)));
+    // A microphone that failed to open isn't retried until its device or settings change.
+    let mut mic_failed: Option<MicSource> = None;
     let mut apps: Vec<AudioApp> = Vec::new();
     let mut last_played = HashMap::new();
     // Each start attempt creates and starts up to 19 AudioUnits, so back off while the
@@ -564,6 +681,9 @@ fn bridge_loop(
                         }
                         Err(error) => debug!("Unable to list audio apps: {error}"),
                     }
+                }
+                if let Some(forward) = handle.block_on(settings.get_macos_mic_forward()) {
+                    mic_gain.store(mic_gain_bits(forward.volume), Ordering::Relaxed);
                 }
                 if let Some(routes) = applied_routes
                     && let Err(error) = sync_app_rules(
@@ -650,9 +770,14 @@ fn bridge_loop(
         ) {
             report_error(&mut last_error, error.to_string());
         }
+        let mic = resolve_mic(handle, settings, app_audio, &mic_gain);
+        if mic_failed != mic {
+            mic_failed = None;
+        }
+        let mic = mic.filter(|_| mic_failed.is_none());
         if active
             .as_ref()
-            .is_some_and(|bridge| bridge.routes != routes)
+            .is_some_and(|bridge| bridge.routes != routes || bridge.mic != mic)
         {
             active = None;
             taps.clear();
@@ -709,9 +834,24 @@ fn bridge_loop(
             if retry_at.is_some_and(|at| Instant::now() < at) {
                 continue;
             }
-            match Bridge::start(physical_uid.clone(), physical_id, ids, routes) {
+            match Bridge::start(
+                physical_uid.clone(),
+                physical_id,
+                ids,
+                routes,
+                mic.as_ref(),
+                mic_gain.clone(),
+            ) {
                 Ok(bridge) => {
                     info!("GoXLR virtual audio bridge started");
+                    if let Some(mic) = &bridge.mic {
+                        info!(
+                            "Forwarding {} into the GoXLR {} channel",
+                            mic.device.name, PLAYBACK_NAMES[mic.route]
+                        );
+                    } else if mic.is_some() {
+                        mic_failed = mic;
+                    }
                     active = Some(bridge);
                     last_error = None;
                     failures = 0;
@@ -749,7 +889,7 @@ fn bridge_loop(
 mod tests {
     use super::{
         BridgeSignal, CAPTURE_ROUTES, PLAYBACK_ROUTES, StereoReader, capture_pair,
-        debounce_apps_changed, set_pair,
+        debounce_apps_changed, mic_gain_bits, set_pair,
     };
     use rtrb::RingBuffer;
     use std::sync::mpsc;
@@ -840,6 +980,32 @@ mod tests {
         for (index, sample) in output.iter().enumerate() {
             assert!((*sample - index as f32).abs() < 0.1);
         }
+    }
+
+    #[test]
+    fn stereo_reader_upsamples_a_slower_source() {
+        // A 16 kHz headset read at 48 kHz: three output frames per input frame.
+        let (mut producer, consumer) = RingBuffer::new(2048);
+        let mut reader = StereoReader::with_step(consumer, 16_000.0 / 48_000.0);
+        for frame in 0..512 {
+            producer.push([frame as f32; 2]).unwrap();
+        }
+        let mut output = [0.0; 96];
+        reader.fill(&mut output, 2);
+        for (index, frame) in output.chunks_exact(2).enumerate() {
+            assert!(
+                (frame[0] - index as f32 / 3.0).abs() < 0.05,
+                "{index}: {frame:?}"
+            );
+            assert_eq!(frame[0], frame[1]);
+        }
+    }
+
+    #[test]
+    fn mic_gain_is_linear_and_capped() {
+        assert_eq!(f32::from_bits(mic_gain_bits(100)), 1.0);
+        assert_eq!(f32::from_bits(mic_gain_bits(50)), 0.5);
+        assert_eq!(f32::from_bits(mic_gain_bits(500)), 2.0);
     }
 
     #[test]

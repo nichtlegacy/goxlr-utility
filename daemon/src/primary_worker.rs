@@ -14,7 +14,8 @@ use enum_map::EnumMap;
 use goxlr_ipc::{
     Activation, Binding, ColourWay, DaemonCommand, DaemonConfig, DaemonStatus, DriverDetails,
     Files, FirmwareSource, FirmwareStatus, GoXLRCommand, HardwareStatus, HttpSettings, Locale,
-    MacosAppAudio, MacosAppRule, PathTypes, Paths, SampleFile, UpdateState, UsbProductInformation,
+    MacosAppAudio, MacosAppRule, MacosMicForward, PathTypes, Paths, SampleFile, UpdateState,
+    UsbProductInformation,
 };
 use goxlr_types::{DeviceType, FirmwareDetails, VersionNumber};
 use goxlr_usb::device::base::GoXLRDevice;
@@ -546,6 +547,14 @@ pub async fn spawn_usb_handler(
                                 change_found = true;
                                 let _ = sender.send(Ok(()));
                             }
+                            DaemonCommand::SetMacOSMicForward(forward) => {
+                                settings.set_macos_mic_forward(forward).await;
+                                settings.save().await;
+                                mic_forward_changed(&app_audio, settings.get_macos_mic_forward().await);
+
+                                change_found = true;
+                                let _ = sender.send(Ok(()));
+                            }
                             DaemonCommand::SetMacOSHotkeys(bindings) => {
                                 settings.set_macos_hotkeys(bindings.clone()).await;
                                 settings.save().await;
@@ -847,6 +856,14 @@ fn hidden_apps_changed(app_audio: &AppAudio, hidden: Vec<String>) {
 }
 
 // Has the macOS main thread register the new hotkeys, other platforms only store them.
+fn mic_forward_changed(app_audio: &AppAudio, forward: Option<MacosMicForward>) {
+    #[cfg(target_os = "macos")]
+    app_audio.mic_forward_changed(forward);
+
+    #[cfg(not(target_os = "macos"))]
+    let _ = (app_audio, forward);
+}
+
 fn hotkeys_changed(bindings: Vec<Binding>) {
     #[cfg(target_os = "macos")]
     crate::platform::macos::hotkeys::register_hotkeys(bindings);

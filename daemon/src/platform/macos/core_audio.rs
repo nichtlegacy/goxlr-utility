@@ -13,13 +13,15 @@ use core_foundation::dictionary::{CFDictionary, CFMutableDictionary, CFMutableDi
 use core_foundation::number::CFNumber;
 use core_foundation::string::{CFString, CFStringRef};
 use coreaudio_sys::{
-    AudioDeviceID, AudioObjectGetPropertyData, AudioObjectGetPropertyDataSize, AudioObjectID,
-    AudioObjectPropertyAddress, AudioObjectSetPropertyData, AudioValueTranslation, KERN_SUCCESS,
+    AudioBuffer, AudioBufferList, AudioDeviceID, AudioObjectGetPropertyData,
+    AudioObjectGetPropertyDataSize, AudioObjectID, AudioObjectPropertyAddress,
+    AudioObjectSetPropertyData, AudioValueTranslation, KERN_SUCCESS,
     kAudioAggregateDevicePropertyFullSubDeviceList, kAudioDevicePropertyDeviceUID,
-    kAudioDevicePropertyPreferredChannelsForStereo, kAudioHardwareNoError,
+    kAudioDevicePropertyNominalSampleRate, kAudioDevicePropertyPreferredChannelsForStereo,
+    kAudioDevicePropertyStreamConfiguration, kAudioHardwareNoError,
     kAudioHardwarePropertyDeviceForUID, kAudioHardwarePropertyDevices,
     kAudioHardwarePropertyPlugInForBundleID, kAudioObjectPropertyElementMaster,
-    kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyScopeInput,
+    kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyScopeInput,
     kAudioObjectPropertyScopeOutput, kAudioObjectSystemObject, kAudioObjectUnknown,
     kAudioPlugInCreateAggregateDevice, kAudioPlugInDestroyAggregateDevice,
 };
@@ -650,4 +652,138 @@ pub fn get_goxlr_devices() -> Result<Vec<CoreAudioDevice>> {
     unsafe { IOObjectRelease(iterator) };
 
     Ok(devices)
+}
+
+/// An input device outside the GoXLR, which the bridge can forward into a playback route.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InputDevice {
+    pub id: AudioDeviceID,
+    pub uid: String,
+    pub name: String,
+    pub channels: usize,
+    pub sample_rate: f64,
+}
+
+/// Lists the input devices that aren't the GoXLR, its virtual devices, or our aggregates.
+/// Only reads HAL properties, so it doesn't build AudioUnits or trigger permission checks.
+pub fn list_input_devices() -> Result<Vec<InputDevice>> {
+    let mut devices: Vec<InputDevice> = get_audio_device_ids()?
+        .into_iter()
+        .filter_map(input_device_for_id)
+        .filter(|device| {
+            !device.name.contains("GoXLR")
+                && !device.uid.starts_with("GoXLRVirtual::")
+                && !device.uid.starts_with(AGGREGATE_PREFIX)
+                && !device.uid.starts_with(LEGACY_PREFIX)
+        })
+        .collect();
+    devices.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(devices)
+}
+
+fn input_device_for_id(id: AudioDeviceID) -> Option<InputDevice> {
+    let channels = get_input_channels(id)?;
+    if channels == 0 {
+        return None;
+    }
+    Some(InputDevice {
+        id,
+        uid: get_uid_for_id(id).ok()?,
+        name: get_device_name(id)?,
+        channels,
+        sample_rate: get_nominal_sample_rate(id)?,
+    })
+}
+
+fn get_device_name(id: AudioDeviceID) -> Option<String> {
+    let address = AudioObjectPropertyAddress {
+        mSelector: kAudioObjectPropertyName,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMaster,
+    };
+    let mut name: CFStringRef = null();
+    let mut size = mem::size_of::<CFStringRef>() as u32;
+    let status = unsafe {
+        AudioObjectGetPropertyData(
+            id,
+            &address,
+            0,
+            null(),
+            &mut size,
+            &mut name as *mut CFStringRef as *mut c_void,
+        )
+    };
+    if status != kAudioHardwareNoError as i32 || name.is_null() {
+        return None;
+    }
+    Some(unsafe { CFString::wrap_under_create_rule(name) }.to_string())
+}
+
+fn get_nominal_sample_rate(id: AudioDeviceID) -> Option<f64> {
+    let address = AudioObjectPropertyAddress {
+        mSelector: kAudioDevicePropertyNominalSampleRate,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMaster,
+    };
+    let mut rate = 0f64;
+    let mut size = mem::size_of::<f64>() as u32;
+    let status = unsafe {
+        AudioObjectGetPropertyData(
+            id,
+            &address,
+            0,
+            null(),
+            &mut size,
+            &mut rate as *mut f64 as *mut c_void,
+        )
+    };
+    (status == kAudioHardwareNoError as i32 && rate > 0.).then_some(rate)
+}
+
+fn get_input_channels(id: AudioDeviceID) -> Option<usize> {
+    let address = AudioObjectPropertyAddress {
+        mSelector: kAudioDevicePropertyStreamConfiguration,
+        mScope: kAudioObjectPropertyScopeInput,
+        mElement: kAudioObjectPropertyElementMaster,
+    };
+    let mut size = 0u32;
+    let status = unsafe { AudioObjectGetPropertyDataSize(id, &address, 0, null(), &mut size) };
+    if status != kAudioHardwareNoError as i32 || (size as usize) < mem::size_of::<u32>() {
+        return None;
+    }
+    // u64s keep the AudioBufferList aligned.
+    let mut storage = vec![0u64; (size as usize).div_ceil(mem::size_of::<u64>())];
+    let list = storage.as_mut_ptr() as *mut AudioBufferList;
+    let status =
+        unsafe { AudioObjectGetPropertyData(id, &address, 0, null(), &mut size, list.cast()) };
+    if status != kAudioHardwareNoError as i32 {
+        return None;
+    }
+    let buffers = unsafe {
+        std::slice::from_raw_parts(
+            ptr::addr_of!((*list).mBuffers) as *const AudioBuffer,
+            (*list).mNumberBuffers as usize,
+        )
+    };
+    Some(
+        buffers
+            .iter()
+            .map(|buffer| buffer.mNumberChannels as usize)
+            .sum(),
+    )
+}
+
+#[cfg(test)]
+mod input_tests {
+    #[test]
+    fn lists_inputs_without_goxlr_devices() {
+        let inputs = super::list_input_devices().unwrap();
+        println!("{inputs:#?}");
+        assert!(inputs.iter().all(|input| !input.name.contains("GoXLR")));
+        assert!(
+            inputs
+                .iter()
+                .all(|input| input.channels > 0 && input.sample_rate > 0.)
+        );
+    }
 }
