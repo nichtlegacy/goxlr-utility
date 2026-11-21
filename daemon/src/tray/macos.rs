@@ -864,13 +864,13 @@ impl UtilityDelegate {
                     channel.into_usize(),
                 ));
             }
-            // Line Out is an output level rather than a channel, 255 is the GoXLR's maximum.
+            // Line In is a hardware input with no virtual route, so it isn't in PLAYBACK_CHANNELS.
             menu.addItem(&self.slider_item(
-                Some("Line Out"),
-                device.volumes[ChannelName::LineOut].into(),
+                Some("Line In"),
+                device.volumes[ChannelName::LineIn].into(),
                 255.,
                 sel!(channelVolume:),
-                ChannelName::LineOut.into_usize(),
+                ChannelName::LineIn.into_usize(),
             ));
             menu.addItem(&App::get_separator(mtm));
         }
