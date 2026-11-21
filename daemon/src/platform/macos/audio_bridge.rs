@@ -430,18 +430,31 @@ impl Bridge {
         units.push(physical_input);
         units.extend(capture_units);
         units.extend(playback_units);
-        units.extend(mic_unit);
         units.push(physical_output);
         let mut bridge = Self {
             physical_uid,
             physical_id: physical,
             routes,
             mic,
-            units: Vec::with_capacity(units.len()),
+            units: Vec::with_capacity(units.len() + 1),
         };
         for mut unit in units {
             unit.start()?;
             bridge.units.push(unit);
+        }
+
+        // Like opening it, starting the microphone may fail (e.g. right after the device was
+        // re-plugged). Keep the GoXLR's own audio running; with `mic: None` the loop marks the
+        // forward as failed and retries it once the device or the settings change.
+        if let Some(mut unit) = mic_unit {
+            match unit.start() {
+                Ok(()) => bridge.units.push(unit),
+                Err(error) => {
+                    if let Some(mic) = bridge.mic.take() {
+                        warn!("Unable to start forwarding {}: {error}", mic.device.name);
+                    }
+                }
+            }
         }
         Ok(bridge)
     }
