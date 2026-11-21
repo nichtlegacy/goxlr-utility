@@ -39,6 +39,36 @@ const VIRTUAL_AUDIO_BUNDLE_ID: &str = "com.github.goxlr-on-linux.goxlr-virtual-a
 const VIRTUAL_AUDIO_ROUTES_SELECTOR: u32 = 0x67787274; // 'gxrt'
 const VIRTUAL_AUDIO_APP_RULES_SELECTOR: u32 = 0x67786170; // 'gxap'
 const VIRTUAL_AUDIO_APP_LEVELS_SELECTOR: u32 = 0x67786c76; // 'gxlv'
+const HARDWARE_SLEEPING_IS_ALLOWED_SELECTOR: u32 = 0x736c6570; // 'slep'
+
+/// Lets the Mac idle-sleep while this process runs audio IO.
+///
+/// The bridge and the per-app taps keep IO running on the GoXLR and the virtual devices all the
+/// time. Without this, coreaudiod holds a `PreventUserIdleSystemSleep` assertion for each of
+/// them and the Mac never sleeps on its own. Apps that play or record through the devices still
+/// hold their own assertions, so real playback keeps the Mac awake.
+pub fn allow_idle_sleep() -> Result<()> {
+    let address = AudioObjectPropertyAddress {
+        mSelector: HARDWARE_SLEEPING_IS_ALLOWED_SELECTOR,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMaster,
+    };
+    let allowed: UInt32 = 1;
+    let status = unsafe {
+        AudioObjectSetPropertyData(
+            kAudioObjectSystemObject,
+            &address,
+            0,
+            null(),
+            mem::size_of::<UInt32>() as u32,
+            &allowed as *const UInt32 as *const c_void,
+        )
+    };
+    if status != kAudioHardwareNoError as i32 {
+        bail!("Unable to allow idle sleep during audio IO: {status}");
+    }
+    Ok(())
+}
 
 fn uid_matches_location(uid: &str, location: u32) -> bool {
     let Some((prefix, _stream)) = uid.rsplit_once(':') else {

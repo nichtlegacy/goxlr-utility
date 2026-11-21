@@ -11,8 +11,8 @@ use crate::events::EventTriggers;
 use crate::platform::macos::app_audio::AppAudioHandle;
 use crate::platform::macos::audio_bridge;
 use crate::platform::macos::core_audio::{
-    CoreAudioDevice, add_sub_device, create_aggregate_device, destroy_aggregate_device,
-    find_all_existing_aggregates, get_goxlr_devices, set_active_channels,
+    CoreAudioDevice, add_sub_device, allow_idle_sleep, create_aggregate_device,
+    destroy_aggregate_device, find_all_existing_aggregates, get_goxlr_devices, set_active_channels,
 };
 use crate::platform::macos::device::{Inputs, Outputs};
 use crate::settings::SettingsHandle;
@@ -38,6 +38,13 @@ pub async fn run(
     // Register before anything else: once tokio (or actix) hooks SIGTERM, the default action
     // is gone, so an unhandled TERM would leave the daemon running without doing anything.
     let mut stream = signal(SignalKind::terminate())?;
+
+    // Set before the bridge opens any IO, so coreaudiod never takes sleep assertions for it.
+    match task::spawn_blocking(allow_idle_sleep).await {
+        Ok(Err(error)) => warn!("{error}"),
+        Err(error) => warn!("Unable to allow idle sleep: {error}"),
+        Ok(Ok(())) => debug!("Idle sleep allowed during GoXLR audio IO"),
+    }
 
     let bridge_stop = stop.clone();
     let bridge = tokio::spawn(async move {
