@@ -39,7 +39,8 @@ remain as a fallback.
 - Switches in **System → Utility Settings** to show or hide optional routes immediately. The
   settings panel is scrollable and has English and German labels. Only enabled routes run bridge
   audio units. The selection is saved and restored when the daemon starts.
-- A menubar menu with sliders for the GoXLR System, Game, Chat, and Music channels, and a list of
+- A menubar menu with volume sliders for GoXLR channels (System, Game, Chat, Music, and Line In by
+  default; pick any channel or output under "Menu bar volume sliders" in the settings), and a list of
   the apps playing to a GoXLR output. Each app can be moved to another GoXLR output and given its
   own volume; the choice is saved per app. Apps already playing to their selected GoXLR output use
   the driver's volume rule. Moving an app from another output uses a CoreAudio process tap and a

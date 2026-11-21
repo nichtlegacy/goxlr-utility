@@ -50,14 +50,36 @@ use crate::tray::macos::TrayOption::{
     OpenPathSamples, Quit,
 };
 
-// The GoXLR channels behind the virtual playback routes, in route order.
-const PLAYBACK_CHANNELS: [ChannelName; 5] = [
+// The order of the menubar volume sliders; which of them show is a setting.
+const MENUBAR_CHANNEL_ORDER: [ChannelName; 11] = [
     ChannelName::System,
     ChannelName::Game,
     ChannelName::Chat,
     ChannelName::Music,
     ChannelName::Sample,
+    ChannelName::Mic,
+    ChannelName::LineIn,
+    ChannelName::Console,
+    ChannelName::Headphones,
+    ChannelName::MicMonitor,
+    ChannelName::LineOut,
 ];
+
+fn channel_label(channel: ChannelName) -> &'static str {
+    match channel {
+        ChannelName::Mic => "Mic",
+        ChannelName::LineIn => "Line In",
+        ChannelName::Console => "Console",
+        ChannelName::System => "System",
+        ChannelName::Game => "Game",
+        ChannelName::Chat => "Chat",
+        ChannelName::Sample => "Sample",
+        ChannelName::Music => "Music",
+        ChannelName::Headphones => "Headphones",
+        ChannelName::MicMonitor => "Mic Monitor",
+        ChannelName::LineOut => "Line Out",
+    }
+}
 
 // App route items are tagged `app index * APP_TAG_STRIDE + route + 1`, 0 being the app's own output.
 const APP_TAG_STRIDE: usize = 8;
@@ -83,6 +105,8 @@ const HOTKEY_UNMUTE_VOLUME: u8 = 128;
 struct TrayDevice {
     serial: String,
     volumes: EnumMap<ChannelName, u8>,
+    // The channels with a volume slider in the menu.
+    channels: Vec<ChannelName>,
 }
 
 // Only the latest value of each control matters, so the menu overwrites these and the tray
@@ -228,6 +252,7 @@ async fn refresh_device(p: &RunParams) {
     let Ok(status) = rx.await else {
         return;
     };
+    let channels = status.config.macos_menubar_channels.unwrap_or_default();
     let device = status
         .mixers
         .iter()
@@ -235,6 +260,7 @@ async fn refresh_device(p: &RunParams) {
         .map(|(serial, mixer)| TrayDevice {
             serial: serial.clone(),
             volumes: mixer.levels.volumes,
+            channels,
         });
     *p.link.device.lock().unwrap() = device;
 }
@@ -850,28 +876,19 @@ impl UtilityDelegate {
 
         if let Some(device) = device {
             menu.addItem(&App::get_header(mtm, "Volume"));
-            for (route, channel) in PLAYBACK_CHANNELS.into_iter().enumerate() {
-                // Sample only has a virtual output while its route is enabled.
-                if channel == ChannelName::Sample && !playback_route_enabled(snapshot.routes, route)
-                {
+            // 255 is the GoXLR's maximum for every channel, outputs included.
+            for channel in MENUBAR_CHANNEL_ORDER {
+                if !device.channels.contains(&channel) {
                     continue;
                 }
                 menu.addItem(&self.slider_item(
-                    Some(PLAYBACK_NAMES[route]),
+                    Some(channel_label(channel)),
                     device.volumes[channel].into(),
                     255.,
                     sel!(channelVolume:),
                     channel.into_usize(),
                 ));
             }
-            // Line In is a hardware input with no virtual route, so it isn't in PLAYBACK_CHANNELS.
-            menu.addItem(&self.slider_item(
-                Some("Line In"),
-                device.volumes[ChannelName::LineIn].into(),
-                255.,
-                sel!(channelVolume:),
-                ChannelName::LineIn.into_usize(),
-            ));
             menu.addItem(&App::get_separator(mtm));
         }
 

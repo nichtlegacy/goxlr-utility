@@ -5,10 +5,10 @@ use directories::ProjectDirs;
 pub use goxlr_ipc::MacosAppRule;
 use goxlr_ipc::{
     Binding, FirmwareSource, GoXLRCommand, LogLevel, MACOS_ALL_VIRTUAL_AUDIO_ROUTES,
-    MACOS_DEFAULT_VIRTUAL_AUDIO_ROUTES, MacosMicForward,
+    MACOS_DEFAULT_MENUBAR_CHANNELS, MACOS_DEFAULT_VIRTUAL_AUDIO_ROUTES, MacosMicForward,
 };
-use goxlr_types::VodMode;
 use goxlr_types::VodMode::Routable;
+use goxlr_types::{ChannelName, VodMode};
 use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -72,6 +72,7 @@ impl SettingsHandle {
                 macos_hidden_apps: None,
                 macos_mic_forward: None,
                 macos_hotkeys: Vec::new(),
+                macos_menubar_channels: None,
                 profile_directory: None,
                 mic_profile_directory: None,
                 samples_directory: None,
@@ -348,6 +349,25 @@ impl SettingsHandle {
     pub async fn set_macos_hotkeys(&self, bindings: Vec<Binding>) {
         let mut settings = self.settings.write().await;
         settings.macos_hotkeys = bindings;
+    }
+
+    pub async fn get_macos_menubar_channels(&self) -> Vec<ChannelName> {
+        let settings = self.settings.read().await;
+        settings
+            .macos_menubar_channels
+            .clone()
+            .unwrap_or_else(|| MACOS_DEFAULT_MENUBAR_CHANNELS.to_vec())
+    }
+
+    pub async fn set_macos_menubar_channels(&self, channels: Vec<ChannelName>) {
+        let mut settings = self.settings.write().await;
+        let mut unique = Vec::with_capacity(channels.len());
+        for channel in channels {
+            if !unique.contains(&channel) {
+                unique.push(channel);
+            }
+        }
+        settings.macos_menubar_channels = Some(unique);
     }
 
     pub async fn get_profile_directory(&self) -> PathBuf {
@@ -817,6 +837,7 @@ pub struct Settings {
     macos_mic_forward: Option<MacosMicForward>,
     #[serde(default)]
     macos_hotkeys: Vec<Binding>,
+    macos_menubar_channels: Option<Vec<ChannelName>>,
     profile_directory: Option<PathBuf>,
     mic_profile_directory: Option<PathBuf>,
     samples_directory: Option<PathBuf>,
@@ -1139,5 +1160,30 @@ mod tests {
     fn loads_settings_without_hotkeys() {
         let settings: Settings = serde_json::from_str(r#"{ "show_tray_icon": true }"#).unwrap();
         assert!(settings.macos_hotkeys.is_empty());
+    }
+
+    #[tokio::test]
+    async fn menubar_channels_default_and_dedupe() {
+        use super::{Arc, MACOS_DEFAULT_MENUBAR_CHANNELS, PathBuf, RwLock, SettingsHandle};
+        let settings: Settings = serde_json::from_str(r#"{ "show_tray_icon": true }"#).unwrap();
+        let handle = SettingsHandle {
+            path: PathBuf::new(),
+            data_dir: PathBuf::new(),
+            settings: Arc::new(RwLock::new(settings)),
+        };
+        assert_eq!(
+            handle.get_macos_menubar_channels().await,
+            MACOS_DEFAULT_MENUBAR_CHANNELS.to_vec()
+        );
+
+        use goxlr_types::ChannelName::{LineIn, Mic};
+        handle
+            .set_macos_menubar_channels(vec![LineIn, Mic, LineIn])
+            .await;
+        assert_eq!(handle.get_macos_menubar_channels().await, vec![LineIn, Mic]);
+
+        // An empty list stays empty rather than falling back to the default.
+        handle.set_macos_menubar_channels(Vec::new()).await;
+        assert!(handle.get_macos_menubar_channels().await.is_empty());
     }
 }

@@ -52,6 +52,9 @@ pub struct DaemonConfig {
     /// Global keyboard shortcuts, `None` on other platforms.
     #[serde(default)]
     pub macos_hotkeys: Option<Vec<Binding>>,
+    /// The channels with a menubar volume slider, `None` on other platforms.
+    #[serde(default)]
+    pub macos_menubar_channels: Option<Vec<ChannelName>>,
 }
 
 /// Per-app audio on macOS.

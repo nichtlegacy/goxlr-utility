@@ -563,6 +563,13 @@ pub async fn spawn_usb_handler(
                                 change_found = true;
                                 let _ = sender.send(Ok(()));
                             }
+                            DaemonCommand::SetMacOSMenubarChannels(channels) => {
+                                settings.set_macos_menubar_channels(channels).await;
+                                settings.save().await;
+
+                                change_found = true;
+                                let _ = sender.send(Ok(()));
+                            }
                         }
                     },
 
@@ -773,6 +780,11 @@ async fn get_daemon_status(
             macos_app_audio: get_app_audio_status(app_audio, settings).await,
             macos_hotkeys: if cfg!(target_os = "macos") {
                 Some(settings.get_macos_hotkeys().await)
+            } else {
+                None
+            },
+            macos_menubar_channels: if cfg!(target_os = "macos") {
+                Some(settings.get_macos_menubar_channels().await)
             } else {
                 None
             },
@@ -1196,13 +1208,16 @@ mod tests {
         let value = serde_json::to_value(DaemonConfig::default()).unwrap();
         assert_eq!(value["macos_app_audio"], serde_json::Value::Null);
         assert_eq!(value["macos_hotkeys"], serde_json::Value::Null);
+        assert_eq!(value["macos_menubar_channels"], serde_json::Value::Null);
 
         // Older clients' configs without the fields still load.
         let mut value = value;
         let config = value.as_object_mut().unwrap();
         config.remove("macos_app_audio");
         config.remove("macos_hotkeys");
+        config.remove("macos_menubar_channels");
         let config: DaemonConfig = serde_json::from_value(value).unwrap();
         assert!(config.macos_app_audio.is_none() && config.macos_hotkeys.is_none());
+        assert!(config.macos_menubar_channels.is_none());
     }
 }

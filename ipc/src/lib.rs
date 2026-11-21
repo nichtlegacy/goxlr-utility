@@ -149,7 +149,19 @@ pub enum DaemonCommand {
 
     // Replaces the global hotkeys, which are only registered on macOS.
     SetMacOSHotkeys(Vec<Binding>),
+
+    // The GoXLR channels that get a volume slider in the macOS menubar.
+    SetMacOSMenubarChannels(Vec<ChannelName>),
 }
+
+/// The menubar sliders on a fresh install, in display order.
+pub const MACOS_DEFAULT_MENUBAR_CHANNELS: [ChannelName; 5] = [
+    ChannelName::System,
+    ChannelName::Game,
+    ChannelName::Chat,
+    ChannelName::Music,
+    ChannelName::LineIn,
+];
 
 pub const MACOS_DEFAULT_VIRTUAL_AUDIO_ROUTES: u32 = 0xF002;
 pub const MACOS_ALL_VIRTUAL_AUDIO_ROUTES: u32 = 0x1FFFF;
