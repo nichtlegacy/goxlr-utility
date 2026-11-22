@@ -41,6 +41,18 @@ microphone access when macOS asks. The targeted `install-local.sh` and
 `uninstall-local.sh` scripts remain available for first-time driver-only tests;
 `install-local.sh` intentionally refuses to replace an existing driver.
 
+Run driver-only updates of an existing installation from the logged-in user's
+terminal.
+
+```sh
+./macos/virtual-audio/update-local.sh /tmp/goxlr-local-build/GoXLRVirtual.driver
+```
+
+The script requests sudo for the driver swap and CoreAudio restart. It saves the
+previous driver under `/Library/Audio/Plug-Ins/GoXLRVirtual-backups` and waits for
+the LaunchAgent to finish unloading before starting it again in the GUI domain.
+Re-running it with the same signed driver starts the agent if needed.
+
 Moving an app from another output to a GoXLR playback device uses a CoreAudio
 process tap. Grant **System Audio Recording** access to GoXLR Audio Bridge when
 macOS asks. An app already on its selected GoXLR device uses the driver's volume

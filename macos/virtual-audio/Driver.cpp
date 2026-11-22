@@ -9,9 +9,11 @@
 #include <aspl/Stream.hpp>
 
 #include <CoreAudio/AudioServerPlugIn.h>
+#include <mach/mach_time.h>
 
 #include <array>
 #include <atomic>
+#include <cmath>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -21,6 +23,9 @@ namespace {
 
 constexpr UInt32 kSampleRate = 48000;
 constexpr size_t kHistoryFrames = 2048;
+constexpr size_t kCaptureHistoryFrames = 4096;
+// Keep capture reads behind the bridge writer, with room for their independent IO cycles.
+constexpr UInt32 kCaptureDelayFrames = 1024;
 constexpr UInt32 kRouteMaskSelector = 0x67787274; // 'gxrt'
 constexpr UInt32 kAppRulesSelector = 0x67786170; // 'gxap'
 constexpr UInt32 kAppLevelsSelector = 0x67786c76; // 'gxlv'
@@ -157,32 +162,43 @@ public:
           playbackRoute_(playbackRoute) {}
 
     std::shared_ptr<aspl::Client> OnAddClient(const aspl::ClientInfo& info) override {
-        auto injected = playbackRoute_ ? router_->cursorsFor(*playbackRoute_)
-                                       : app_routing::Router::Cursors{};
-        return std::make_shared<AudioClient>(info, history_->publishedFrames(), injected);
+        if (!playbackRoute_) {
+            return aspl::ControlRequestHandler::OnAddClient(info);
+        }
+        return std::make_shared<AudioClient>(info, history_->publishedFrames(),
+                                             router_->cursorsFor(*playbackRoute_));
     }
 
     void OnWriteMixedOutput(const std::shared_ptr<aspl::Stream>&,
                             Float64, Float64 timestamp, const void* bytes,
                             UInt32 bytesCount) override {
-        history_->push(static_cast<const float*>(bytes), bytesCount / (channels_ * sizeof(float)));
+        const auto* samples = static_cast<const float*>(bytes);
+        const UInt32 frames = bytesCount / (channels_ * sizeof(float));
         if (playbackRoute_) {
+            history_->push(samples, frames);
             router_->flush(*playbackRoute_, timestamp);
+        } else {
+            history_->writeAt(std::llround(timestamp) + kCaptureDelayFrames, samples, frames);
         }
     }
 
     void OnReadClientInput(const std::shared_ptr<aspl::Client>& client,
                            const std::shared_ptr<aspl::Stream>&,
-                           Float64, Float64, void* bytes, UInt32 bytesCount) override {
-        auto audioClient = std::static_pointer_cast<AudioClient>(client);
+                           Float64, Float64 timestamp, void* bytes, UInt32 bytesCount) override {
+        auto* samples = static_cast<float*>(bytes);
         const UInt32 frames = bytesCount / (channels_ * sizeof(float));
-        history_->read(audioClient->cursor, static_cast<float*>(bytes), frames);
+        if (!playbackRoute_) {
+            // CoreAudio can request intersecting windows on behalf of different clients.
+            history_->readAt(std::llround(timestamp), samples, frames);
+            return;
+        }
+
+        auto audioClient = std::static_pointer_cast<AudioClient>(client);
+        history_->read(audioClient->cursor, samples, frames);
         // Only a playback route's bridge reads input from this handler, and the HAL serves its
         // clients one at a time on the device's IO thread, so the scratch buffer isn't shared.
-        if (playbackRoute_) {
-            router_->mixInjected(*playbackRoute_, audioClient->injected,
-                                 static_cast<float*>(bytes), frames, injectedScratch_.data());
-        }
+        router_->mixInjected(*playbackRoute_, audioClient->injected,
+                             samples, frames, injectedScratch_.data());
     }
 
 private:
@@ -198,7 +214,9 @@ private:
 // These devices carry the GoXLR's USB audio, so report that transport instead.
 class GoXLRDevice final : public aspl::Device {
 public:
-    using aspl::Device::Device;
+    GoXLRDevice(const std::shared_ptr<const aspl::Context>& context,
+                const aspl::DeviceParameters& params, bool capture)
+        : aspl::Device(context, params), capture_(capture) {}
 
     UInt32 GetTransportType() const override { return kAudioDeviceTransportTypeUSB; }
 
@@ -210,6 +228,23 @@ public:
     }
 
 protected:
+    OSStatus GetZeroTimeStampImpl(UInt32 clientID, Float64* sampleTime,
+                                  UInt64* hostTime, UInt64* seed) override {
+        if (!capture_) {
+            return aspl::Device::GetZeroTimeStampImpl(clientID, sampleTime, hostTime, seed);
+        }
+
+        // The source and sink of a capture route start independently. Give them the same
+        // 48 kHz timeline based on host uptime so either end can restart without shifting it.
+        const UInt32 period = GetZeroTimeStampPeriod();
+        const Float64 ticksPerPeriod = captureTicksPerFrame_ * period;
+        const auto elapsedPeriods = static_cast<UInt64>(mach_absolute_time() / ticksPerPeriod);
+        *sampleTime = elapsedPeriods * period;
+        *hostTime = static_cast<UInt64>(elapsedPeriods * ticksPerPeriod);
+        *seed = 1;
+        return kAudioHardwareNoError;
+    }
+
     OSStatus WillDoIOOperationImpl(UInt32 clientID, UInt32 operationID, Boolean* outWillDo,
                                    Boolean* outWillDoInPlace) override {
         if (plugin_ && operationID == kAudioServerPlugInIOOperationProcessOutput) {
@@ -238,6 +273,14 @@ protected:
     }
 
 private:
+    static Float64 captureTicksPerFrame() {
+        mach_timebase_info_data_t timebase;
+        mach_timebase_info(&timebase);
+        return 1e9 * timebase.denom / timebase.numer / kSampleRate;
+    }
+
+    const bool capture_;
+    const Float64 captureTicksPerFrame_ = capture_ ? captureTicksPerFrame() : 0.0;
     std::shared_ptr<RoutePlugin> plugin_;
     size_t playbackRoute_ = 0;
 };
@@ -266,6 +309,7 @@ std::shared_ptr<GoXLRDevice> addDevice(const std::shared_ptr<aspl::Context>& con
                aspl::Direction direction,
                UInt32 channels,
                bool hidden,
+               bool capture,
                const std::shared_ptr<LoopbackHandler>& handler) {
     aspl::DeviceParameters params;
     params.Name = name;
@@ -277,7 +321,11 @@ std::shared_ptr<GoXLRDevice> addDevice(const std::shared_ptr<aspl::Context>& con
     params.CanBeDefault = !hidden;
     params.CanBeDefaultForSystemSounds = !hidden;
 
-    auto device = std::make_shared<GoXLRDevice>(context, params);
+    if (capture && direction == aspl::Direction::Input) {
+        params.Latency = kCaptureDelayFrames;
+    }
+
+    auto device = std::make_shared<GoXLRDevice>(context, params, capture);
     device->AddStreamAsync(audioStream(direction, channels));
     device->SetControlHandler(handler);
     device->SetIOHandler(handler);
@@ -324,19 +372,22 @@ std::shared_ptr<aspl::Driver> createDriver() {
         const auto playbackRoute = index >= kFirstPlaybackRoute
                                        ? std::optional<size_t>(index - kFirstPlaybackRoute)
                                        : std::nullopt;
+        const bool capture = !playbackRoute;
+        const size_t historyFrames = capture ? kCaptureHistoryFrames : kHistoryFrames;
         auto handler = std::make_shared<LoopbackHandler>(
-            std::make_shared<StereoHistory>(kHistoryFrames, route.channels), route.channels,
+            std::make_shared<StereoHistory>(historyFrames, route.channels), route.channels,
             plugin->router(), playbackRoute);
         const bool visibleByDefault = (kDefaultRouteMask & (1u << index)) != 0;
         auto visibleDevice = addDevice(context, plugin, std::string("GoXLR ") + route.name,
                                        route.uid, route.visibleDirection, route.channels,
-                                       !visibleByDefault, handler);
+                                       !visibleByDefault, capture, handler);
         if (playbackRoute) {
             visibleDevice->EnableAppRouting(plugin, *playbackRoute);
         }
         plugin->SetVisibleDevice(index, visibleDevice);
         addDevice(context, plugin, std::string("GoXLR ") + route.name + " Bridge",
-                  std::string(route.uid) + "::Bridge", route.bridgeDirection, route.channels, true, handler);
+                  std::string(route.uid) + "::Bridge", route.bridgeDirection, route.channels,
+                  true, capture, handler);
     }
     return std::make_shared<aspl::Driver>(context, plugin);
 }

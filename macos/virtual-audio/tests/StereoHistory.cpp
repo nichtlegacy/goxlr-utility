@@ -1,5 +1,6 @@
 #include "StereoHistory.hpp"
 
+#include <array>
 #include <cassert>
 #include <atomic>
 #include <thread>
@@ -13,6 +14,32 @@ int main() {
     mono.push(monoInput, 3);
     mono.read(monoCursor, monoOutput, 3);
     assert(monoOutput[0] == 1 && monoOutput[1] == 2 && monoOutput[2] == 3);
+
+    // Two capture clients may request 512 frames at different positions on the same timeline.
+    // The second read must preserve the first window's last 96 frames when the windows overlap.
+    StereoHistory capture(2048, 1);
+    constexpr uint64_t startFrame = 4096;
+    constexpr size_t blockFrames = 512;
+    constexpr size_t secondOffset = 416;
+    std::array<float, blockFrames + secondOffset> source;
+    for (size_t i = 0; i < source.size(); ++i) source[i] = float(i + 1);
+    capture.writeAt(startFrame, source.data(), blockFrames);
+    capture.writeAt(startFrame + blockFrames, source.data() + blockFrames, secondOffset);
+
+    std::array<float, blockFrames + secondOffset> captured{};
+    capture.readAt(startFrame, captured.data(), blockFrames);
+    capture.readAt(startFrame + secondOffset, captured.data() + secondOffset, blockFrames);
+    assert(captured == source);
+    capture.readAt(startFrame, captured.data(), blockFrames);
+    assert(captured == source);
+
+    // Restarting the writer leaves a hole on the timeline without moving the surrounding audio.
+    const float resumed = 1000;
+    const auto endFrame = startFrame + source.size();
+    capture.writeAt(endFrame + 1, &resumed, 1);
+    float gap[3]{};
+    capture.readAt(endFrame - 1, gap, 3);
+    assert(gap[0] == source.back() && gap[1] == 0 && gap[2] == resumed);
 
     StereoHistory history(128);
     std::vector<float> input(128 * 2);
