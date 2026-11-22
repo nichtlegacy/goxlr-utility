@@ -48,6 +48,11 @@ add_executable(GoXLRVirtualRoutingTest tests/AppRouting.cpp)
 target_include_directories(GoXLRVirtualRoutingTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 add_test(NAME GoXLRVirtualRoutingTest COMMAND GoXLRVirtualRoutingTest)
 
+add_executable(GoXLRVirtualPlaybackTest tests/Playback.cpp)
+target_link_libraries(GoXLRVirtualPlaybackTest PRIVATE libASPL "-framework CoreAudio" "-framework CoreFoundation")
+add_test(NAME GoXLRVirtualPlaybackTest COMMAND GoXLRVirtualPlaybackTest)
+
 # The tests rely on assert(), keep it active in Release builds too.
 target_compile_options(GoXLRVirtualRingTest PRIVATE -UNDEBUG)
 target_compile_options(GoXLRVirtualRoutingTest PRIVATE -UNDEBUG)
+target_compile_options(GoXLRVirtualPlaybackTest PRIVATE -UNDEBUG)

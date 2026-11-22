@@ -29,6 +29,17 @@ It writes `GoXLR Utility.app` and `GoXLRVirtual.driver` to the output directory.
 The daemon serves the checked-in `daemon/web-content` UI; rebuild that directory
 from the separate `goxlr-ui` repository when changing the UI source.
 
+## Verify driver changes
+
+Before installing a driver change, run the CMake tests for overlapping capture
+reads and short playback streams on the candidate build. Use the
+[audio measurement guide](tools/README.md) to record a live baseline with one and
+two capture clients and with a short sound on an idle playback route. Repeat the
+measurements after installation with the same routes and signal.
+
+The [2026-11-22 incident note](incidents/2026-11-22-dry-mic.md) records the Dry Mic
+failure, the update race, and the checks for silent macOS alerts.
+
 ## Local installation
 
 Back up any existing app, HAL driver, and GoXLR LaunchAgent before replacing
